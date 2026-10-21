@@ -13,7 +13,7 @@ import {
   samplePalette,
   shade
 } from "./sampling.js";
-import { GeometryBuilder, RigModel } from "./geometry.js";
+import { GeometryBuilder, OSRS_NPC_LIGHT, RigModel } from "./geometry.js";
 import { Activity, WALK_CYCLE_SPEED, approach, strikeCurve } from "./pose.js";
 
 const DARK = [0.06, 0.05, 0.05];
@@ -254,6 +254,8 @@ export class CreatureModel extends RigModel {
     this.legs = [];
     this.wings = null;
     this.tail = null;
+    // NPCs are lit more from above than players, as in the RS client.
+    this.lighting = { light: OSRS_NPC_LIGHT, contrast: 850 };
     BUILDERS[spec.family](this, spec);
     this.headRestZ = this.head?.position.z ?? 0;
   }

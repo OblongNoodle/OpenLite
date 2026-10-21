@@ -9,6 +9,7 @@ import { ACTIVITY_BY_STATE, Activity, LOOP_INTERVAL_MS, STRIKE_DURATION_MS } fro
 import { DEFAULT_COLORS, HumanModel, humanoidCreatureFor, loadHumanSpec, loadHumanoidCreatureSpec } from "./models3d/human.js";
 import { CreatureModel, creatureFamilyFor, loadCreatureSpec } from "./models3d/creatures.js";
 import { ITEM_SIZE, itemYaw, loadItemGeometry } from "./models3d/items.js";
+import { buildScenery, loadSceneryColors, sceneryKindFor } from "./models3d/scenery.js";
 
 // Model specs are cached per sprite so identical NPCs share one analysis.
 const MAX_CACHED_SPECS = 256;
@@ -50,6 +51,14 @@ var Models3D = class extends Plugin {
     this.specCache = new Map();
     this.itemRecords = new Map();
     this.itemSources = new Map();
+    this.sceneryRecords = new Map();
+    this.settings.scenery = {
+      text: "3D trees, rocks and bushes",
+      type: SettingsTypes.checkbox,
+      value: true,
+      callback: () => {
+      }
+    };
   }
 
   init() {
@@ -64,6 +73,8 @@ var Models3D = class extends Plugin {
     this.specCache ??= new Map();
     this.itemRecords ??= new Map();
     this.itemSources ??= new Map();
+    this.sceneryRecords ??= new Map();
+    this.settings.scenery ??= { text: "3D trees, rocks and bushes", type: SettingsTypes.checkbox, value: true, callback: () => {} };
     this.settings.creatures ??= { text: "3D creatures", type: SettingsTypes.checkbox, value: true, callback: () => {} };
     this.settings.groundItems ??= { text: "3D ground items", type: SettingsTypes.checkbox, value: true, callback: () => {} };
     this.attachRenderObserver();
@@ -76,6 +87,7 @@ var Models3D = class extends Plugin {
     for (const record of this.records.values()) this.disposeRecord(record);
     this.records.clear();
     this.clearGroundItems();
+    this.clearScenery();
     // Specs are cheap to rebuild and may come from older code after a hot swap.
     this.specCache.clear();
     for (const key of ["material", "translucentMaterial"]) {
@@ -131,11 +143,15 @@ var Models3D = class extends Plugin {
     if (this[key]) return this[key];
     const { StandardMaterial, Color3 } = this.ctors;
     const material = new StandardMaterial(`models3d-${key}`, this.scene);
-    material.diffuseColor = new Color3(1, 1, 1);
+    // OSRS-style lighting is baked into the vertex colours, so the scene's
+    // lights are not applied again: with lighting disabled the output is the
+    // emissive colour times the vertex colour. emissiveColor follows the
+    // scene's light level each frame (see updateMaterialBrightness) so models
+    // dim in caves.
+    material.disableLighting = true;
+    material.diffuseColor = new Color3(0, 0, 0);
     material.specularColor = new Color3(0, 0, 0);
-    // Sprites render unlit at full brightness; partial self-illumination keeps the
-    // model readable next to them in dark areas while still showing face shading.
-    material.emissiveColor = new Color3(0.28, 0.28, 0.28);
+    material.emissiveColor = new Color3(1, 1, 1);
     if (translucent) material.alpha = 0.55;
     this[key] = material;
     return material;
@@ -204,7 +220,19 @@ var Models3D = class extends Plugin {
     return [key, spec];
   }
 
+  // Baked-lit models still follow the overall light level (daylight, caves,
+  // night if the OSRS World plugin is off), with a floor so they stay readable.
+  updateMaterialBrightness() {
+    const light = this.gameHooks.AtmosphereManager?.Instance?.HemisphericLight;
+    if (!light) return;
+    const level = (channel) => Math.min(1, Math.max(0.45, light.diffuse[channel] * light.intensity * 1.1));
+    for (const material of [this.material, this.translucentMaterial]) {
+      material?.emissiveColor.set(level("r"), level("g"), level("b"));
+    }
+  }
+
   renderFrame(scene) {
+    this.updateMaterialBrightness();
     const deltaMs = scene.getEngine().getDeltaTime();
     const now = performance.now();
     const seen = new Set();
@@ -267,6 +295,7 @@ var Models3D = class extends Plugin {
     }
 
     this.renderGroundItems();
+    this.renderScenery();
 
     for (const exhibit of this.gallery ?? []) {
       const pose = { ...this.galleryPose, strike: null };
@@ -316,13 +345,84 @@ var Models3D = class extends Plugin {
     }
   }
 
+  // Trees, rocks and bushes are replaced by generated models stretched over
+  // the original's visible meshes. The originals stay in the scene, invisible,
+  // as click targets; a chopped tree or mined rock is rebuilt for its new state.
+  renderScenery() {
+    const worldEntities = this.gameHooks.WorldEntityManager?.Instance?.WorldEntities;
+    const enabled = this.settings.scenery.value && this.ctors && worldEntities;
+    const seen = new Set();
+    if (enabled) {
+      for (const entity of worldEntities.values()) {
+        const appearance = entity?.Appearance;
+        const meshes = appearance?.BJSMeshes;
+        const kind = sceneryKindFor(appearance?.MeshFileName);
+        if (!kind || !meshes?.length || entity.IsDestroyed) continue;
+        seen.add(entity);
+        let record = this.sceneryRecords.get(entity);
+        if (!record) {
+          record = { entity, appearance, kind, colors: null, mesh: null, state: undefined };
+          this.sceneryRecords.set(entity, record);
+          loadSceneryColors(kind, meshes).then((colors) => (record.colors = colors));
+        }
+        // Instances draw with their source mesh's visibility, so hide the source
+        // (every copy of that object gets a replacement anyway).
+        for (const mesh of meshes) {
+          const drawn = mesh.sourceMesh ?? mesh;
+          if (drawn.visibility !== 0) drawn.visibility = 0;
+        }
+        const state = appearance.VisualResourceState;
+        if (record.colors && record.state !== state) this.buildSceneryModel(record, state);
+      }
+    }
+    for (const [entity, record] of this.sceneryRecords) {
+      if (seen.has(entity)) continue;
+      this.disposeSceneryRecord(record);
+      this.sceneryRecords.delete(entity);
+    }
+  }
+
+  buildSceneryModel(record, state) {
+    // Fit to the bounds of the original meshes currently shown for this state.
+    const shown = record.appearance.BJSMeshes.filter((mesh) => mesh.isEnabled());
+    if (!shown.length) return;
+    let min = null, max = null;
+    for (const mesh of shown) {
+      mesh.computeWorldMatrix(true);
+      const box = mesh.getBoundingInfo().boundingBox;
+      min = min ? min.minimizeInPlace(box.minimumWorld) : box.minimumWorld.clone();
+      max = max ? max.maximizeInPlace(box.maximumWorld) : box.maximumWorld.clone();
+    }
+    record.mesh?.dispose();
+    const geometry = buildScenery(record.kind, record.colors, record.entity.EntityID, state).bakeLighting();
+    const mesh = geometry.applyTo(new this.ctors.Mesh(`models3d-scenery-${record.entity.EntityID}`, this.scene));
+    mesh.material = this.getMaterial();
+    mesh.isPickable = false;
+    mesh.position.set((min.x + max.x) / 2, min.y, (min.z + max.z) / 2);
+    mesh.scaling.set(max.x - min.x, max.y - min.y, max.z - min.z);
+    mesh.freezeWorldMatrix();
+    record.mesh = mesh;
+    record.state = state;
+  }
+
+  disposeSceneryRecord(record) {
+    record.mesh?.dispose();
+    record.mesh = null;
+    if (!record.entity.IsDestroyed) for (const mesh of record.appearance.BJSMeshes ?? []) (mesh.sourceMesh ?? mesh).visibility = 1;
+  }
+
+  clearScenery() {
+    for (const record of this.sceneryRecords?.values() ?? []) this.disposeSceneryRecord(record);
+    this.sceneryRecords?.clear();
+  }
+
   // One hidden source mesh per item icon; ground items are instances of it.
   getItemSource(info, cellIndex) {
     const key = `${info.SpritesheetURL}#${cellIndex}`;
     let source = this.itemSources.get(key);
     if (!source) {
       source = loadItemGeometry(info, cellIndex).then((geometry) => {
-        const mesh = geometry.applyTo(new this.ctors.Mesh(`models3d-itemsource-${cellIndex}`, this.scene));
+        const mesh = geometry.bakeLighting().applyTo(new this.ctors.Mesh(`models3d-itemsource-${cellIndex}`, this.scene));
         mesh.material = this.getMaterial();
         mesh.isPickable = false;
         mesh.setEnabled(false);

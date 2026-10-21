@@ -1,6 +1,43 @@
 // Low-poly geometry building and the base for every jointed model.
 import { DIRECTION_YAW, TURN_RATE, approach } from "./pose.js";
 
+// The RS client lights players and objects from (-50, -10, -50) in its own
+// axes (X left, Y down, Z toward the viewer for a model facing it). In ours
+// (X right, Y up, a model facing +Z) that is light from the model's front
+// right, slightly from above.
+export const OSRS_LIGHT = [50, 10, 50];
+// NPCs are lit more from above: (-30, -50, -30), with contrast 850.
+export const OSRS_NPC_LIGHT = [30, 50, 30];
+// Lowest lighting factor applied to any surface.
+const MIN_LIGHT_FACTOR = 0.4;
+
+function rgbToHsl(r, g, b) {
+  const max = Math.max(r, g, b), min = Math.min(r, g, b);
+  const l = (max + min) / 2;
+  if (max === min) return [0, 0, l];
+  const d = max - min;
+  const s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+  let h;
+  if (max === r) h = (g - b) / d + (g < b ? 6 : 0);
+  else if (max === g) h = (b - r) / d + 2;
+  else h = (r - g) / d + 4;
+  return [h / 6, s, l];
+}
+
+function hslToRgb(h, s, l) {
+  if (s === 0) return [l, l, l];
+  const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
+  const p = 2 * l - q;
+  const channel = (t) => {
+    t = ((t % 1) + 1) % 1;
+    if (t < 1 / 6) return p + (q - p) * 6 * t;
+    if (t < 1 / 2) return q;
+    if (t < 2 / 3) return p + (q - p) * (2 / 3 - t) * 6;
+    return p;
+  };
+  return [channel(h + 1 / 3), channel(h), channel(h - 1 / 3)];
+}
+
 // Lathe detail multipliers: sides per ring, and rings per profile segment.
 const LATHE_SIDE_DETAIL = 1.5;
 const LATHE_RING_DETAIL = 2;
@@ -19,8 +56,29 @@ function refineProfile(profile, factor) {
     }
   }
   result.push(profile[profile.length - 1]);
-  // Radii never go negative where the curve overshoots.
-  return result.map(([t, rx, ry]) => [t, Math.max(0, rx), Math.max(0, ry)]);
+  // Radii (the values after t, up to three) never go negative where the curve
+  // overshoots; later values (offsets, squareness) pass through.
+  return result.map((values) => values.map((value, i) => (i >= 1 && i <= 3 ? Math.max(0, value) : value)));
+}
+
+function hash3(x, y, z) {
+  const value = Math.sin(x * 127.1 + y * 311.7 + z * 74.7) * 43758.5453;
+  return value - Math.floor(value);
+}
+
+// Smooth 3D value noise in [-1, 1].
+export function noise3(x, y, z) {
+  const x0 = Math.floor(x), y0 = Math.floor(y), z0 = Math.floor(z);
+  const fade = (t) => t * t * (3 - 2 * t);
+  const fx = fade(x - x0), fy = fade(y - y0), fz = fade(z - z0);
+  const lerp = (a, b, t) => a + (b - a) * t;
+  const corner = (dx, dy, dz) => hash3(x0 + dx, y0 + dy, z0 + dz);
+  const value = lerp(
+    lerp(lerp(corner(0, 0, 0), corner(1, 0, 0), fx), lerp(corner(0, 1, 0), corner(1, 1, 0), fx), fy),
+    lerp(lerp(corner(0, 0, 1), corner(1, 0, 1), fx), lerp(corner(0, 1, 1), corner(1, 1, 1), fx), fy),
+    fz
+  );
+  return value * 2 - 1;
 }
 
 // Accumulates flat-shaded, vertex-coloured boxes into one set of buffers.
@@ -138,6 +196,141 @@ export class GeometryBuilder {
     return this;
   }
 
+  // A smooth-shaded body shape swept through sculpted cross-sections, for
+  // anatomy (chests, calves, jaws, toes). Each ring is
+  //   { t, w, f, b, ox = 0, oz = 0, n = 2.4 }
+  // t: position along the axis; w: half-width across; f/b: depth to the front
+  // and back (along "y": +Z/-Z; along "z": up/down); ox/oz: offset of the
+  // ring's centre; n: squareness (2 = ellipse, higher = boxier, as OSRS models
+  // are). Extra rings are interpolated smoothly between those given.
+  loft(rings, sides, centerX, centerY, centerZ, color, { axis = "y", tiltX = 0, tiltZ = 0, caps = true } = {}) {
+    const fields = ["t", "w", "f", "b", "ox", "oz", "n"];
+    const asArrays = rings.map((r) => [r.t, r.w, r.f, r.b, r.ox ?? 0, r.oz ?? 0, r.n ?? 2.4]);
+    const refined = refineProfile(asArrays, LATHE_RING_DETAIL).map((values) => Object.fromEntries(fields.map((key, i) => [key, values[i]])));
+    sides = Math.round(sides * LATHE_SIDE_DETAIL);
+    const cx = Math.cos(tiltX), sx = Math.sin(tiltX);
+    const cz = Math.cos(tiltZ), sz = Math.sin(tiltZ);
+    const rotate = ([x, y, z]) => {
+      const y1 = y * cx - z * sx, z1 = y * sx + z * cx;
+      return [x * cz - y1 * sz, x * sz + y1 * cz, z1];
+    };
+    const place = (t, across, depth, ox, oz) => (axis === "y" ? [ox + across, t, oz + depth] : [ox + across, oz + depth, t]);
+    const base = this.positions.length / 3;
+    const centers = [];
+    for (const ring of refined) {
+      const exponent = 2 / Math.max(1.2, ring.n);
+      for (let k = 0; k < sides; k++) {
+        const angle = Math.PI / sides + (k / sides) * Math.PI * 2;
+        const c = Math.cos(angle), s = Math.sin(angle);
+        const across = Math.max(0, ring.w) * Math.sign(c) * Math.abs(c) ** exponent;
+        const depth = Math.max(0, s >= 0 ? ring.f : ring.b) * Math.sign(s) * Math.abs(s) ** exponent;
+        const [x, y, z] = rotate(place(ring.t, across, depth, ring.ox, ring.oz));
+        this.positions.push(x + centerX, y + centerY, z + centerZ);
+        this.normals.push(0, 0, 0);
+        this.colors.push(color[0], color[1], color[2], 1);
+      }
+      centers.push(rotate(place(ring.t, 0, 0, ring.ox, ring.oz)));
+    }
+    const start = this.indices.length;
+    const index = (i, k) => base + i * sides + (k % sides);
+    const vertex = (v) => [this.positions[v * 3], this.positions[v * 3 + 1], this.positions[v * 3 + 2]];
+    // Babylon front faces are those whose (b - a) x (c - a) points inward;
+    // pick the winding per segment by checking one quad against its centre.
+    const facesOut = (a, b, c, inside) => {
+      const [pa, pb, pc] = [vertex(a), vertex(b), vertex(c)];
+      const u = [pb[0] - pa[0], pb[1] - pa[1], pb[2] - pa[2]], v = [pc[0] - pa[0], pc[1] - pa[1], pc[2] - pa[2]];
+      const n = [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]];
+      const out = [pa[0] - centerX - inside[0], pa[1] - centerY - inside[1], pa[2] - centerZ - inside[2]];
+      return n[0] * out[0] + n[1] * out[1] + n[2] * out[2] < 0;
+    };
+    for (let i = 0; i + 1 < refined.length; i++) {
+      const middle = centers[i].map((value, c) => (value + centers[i + 1][c]) / 2);
+      const keep = facesOut(index(i, 0), index(i, 1), index(i + 1, 0), middle);
+      for (let k = 0; k < sides; k++) {
+        const [a, b, c, d] = [index(i, k), index(i, k + 1), index(i + 1, k + 1), index(i + 1, k)];
+        if (keep) this.indices.push(a, b, d, b, c, d);
+        else this.indices.push(a, d, b, b, d, c);
+      }
+    }
+    if (caps) {
+      for (const [ring, inner] of [[0, 1], [refined.length - 1, refined.length - 2]]) {
+        const center = this.positions.length / 3;
+        const [x, y, z] = centers[ring];
+        this.positions.push(x + centerX, y + centerY, z + centerZ);
+        this.normals.push(0, 0, 0);
+        this.colors.push(color[0], color[1], color[2], 1);
+        const keep = facesOut(center, index(ring, 0), index(ring, 1), centers[inner]);
+        for (let k = 0; k < sides; k++) {
+          const [a, b] = [index(ring, k), index(ring, k + 1)];
+          if (keep) this.indices.push(center, a, b);
+          else this.indices.push(center, b, a);
+        }
+      }
+    }
+    this.smoothNormals(base, start);
+    return this;
+  }
+
+  // A smooth, lumpy sphere: a latitude/longitude grid pushed in and out by
+  // noise. radii is [rx, ry, rz]. Options: seed (varies the lumps), roughness
+  // (how far lumps push, as a fraction of the radius), flatBottom (cuts the
+  // underside flat at this fraction of ry below the centre, for things resting
+  // on the ground), and colorAt(direction, noise) to vary colour per vertex.
+  blob([rx, ry, rz], centerX, centerY, centerZ, color, { seed = 0, roughness = 0.15, sides = 12, rings = 8, flatBottom = null, colorAt = null } = {}) {
+    const base = this.positions.length / 3;
+    const ring = [];
+    for (let r = 0; r <= rings; r++) {
+      const latitude = -Math.PI / 2 + (r / rings) * Math.PI;
+      const count = r === 0 || r === rings ? 1 : sides;
+      const row = [];
+      for (let k = 0; k < count; k++) {
+        const longitude = (k / sides) * Math.PI * 2 + (r % 2) * Math.PI / sides;
+        const dir = [Math.cos(latitude) * Math.cos(longitude), Math.sin(latitude), Math.cos(latitude) * Math.sin(longitude)];
+        const lump = noise3(dir[0] * 1.8 + seed * 7.1, dir[1] * 1.8 + seed * 3.3, dir[2] * 1.8 + seed * 5.7);
+        const scale = 1 + roughness * lump;
+        let y = dir[1] * ry * scale;
+        if (flatBottom !== null) y = Math.max(y, -ry * flatBottom);
+        this.positions.push(dir[0] * rx * scale + centerX, y + centerY, dir[2] * rz * scale + centerZ);
+        this.normals.push(0, 0, 0);
+        const c = colorAt ? colorAt(dir, lump) : color;
+        this.colors.push(c[0], c[1], c[2], 1);
+        row.push(this.positions.length / 3 - 1);
+      }
+      ring.push(row);
+    }
+    const start = this.indices.length;
+    for (let r = 0; r < rings; r++) {
+      const lower = ring[r], upper = ring[r + 1];
+      for (let k = 0; k < sides; k++) {
+        const a = lower[k % lower.length], b = lower[(k + 1) % lower.length];
+        const c = upper[(k + 1) % upper.length], d = upper[k % upper.length];
+        // Viewed from outside, a -> b runs east and d sits north of a.
+        if (a !== b) this.indices.push(a, b, d);
+        if (c !== d) this.indices.push(b, c, d);
+      }
+    }
+    this.smoothNormals(base, start);
+    return this;
+  }
+
+  // Averages face normals onto the vertices from `firstVertex` on, using the
+  // triangles from `firstIndex` on.
+  smoothNormals(firstVertex, firstIndex) {
+    const p = this.positions, n = this.normals;
+    for (let i = firstIndex; i < this.indices.length; i += 3) {
+      const [a, b, c] = [this.indices[i], this.indices[i + 1], this.indices[i + 2]];
+      const u = [p[b * 3] - p[a * 3], p[b * 3 + 1] - p[a * 3 + 1], p[b * 3 + 2] - p[a * 3 + 2]];
+      const v = [p[c * 3] - p[a * 3], p[c * 3 + 1] - p[a * 3 + 1], p[c * 3 + 2] - p[a * 3 + 2]];
+      // Babylon's left-handed winding: the outward normal is v x u.
+      const f = [v[1] * u[2] - v[2] * u[1], v[2] * u[0] - v[0] * u[2], v[0] * u[1] - v[1] * u[0]];
+      for (const vertex of [a, b, c]) for (let k = 0; k < 3; k++) n[vertex * 3 + k] += f[k];
+    }
+    for (let vertex = firstVertex; vertex < p.length / 3; vertex++) {
+      const length = Math.hypot(n[vertex * 3], n[vertex * 3 + 1], n[vertex * 3 + 2]) || 1;
+      for (let k = 0; k < 3; k++) n[vertex * 3 + k] /= length;
+    }
+  }
+
   // One flat face (triangle or quad), wound so its normal points away from
   // `inside`, offset by the given centre.
   polygon(corners, inside, centerX, centerY, centerZ, color) {
@@ -162,6 +355,32 @@ export class GeometryBuilder {
     // Same winding rule as box(): corners ordered so (c1 - c0) x (cN - c0)
     // points outward are emitted as (0, 2, 1), (0, 3, 2).
     for (let k = 1; k + 1 < corners.length; k++) this.indices.push(base, base + k + 1, base + k);
+    return this;
+  }
+
+  // OSRS model lighting, baked into the vertex colours once (as the RS client
+  // does when it builds a model): each vertex's HSL lightness is scaled by
+  //   (ambient + (65536 / contrast) * cos(angle to light)) / 128
+  // and clamped like the client's 7-bit lightness. Defaults are the client's
+  // player/object values (ambient 64, contrast 768, light from -50,-10,-50),
+  // with its Y-down axes converted to ours.
+  bakeLighting({ light = OSRS_LIGHT, ambient = 64, contrast = 768 } = {}) {
+    const length = Math.hypot(...light);
+    const [lx, ly, lz] = light.map((value) => value / length);
+    const strength = 65536 / contrast;
+    for (let v = 0; v < this.positions.length / 3; v++) {
+      const nx = this.normals[v * 3], ny = this.normals[v * 3 + 1], nz = this.normals[v * 3 + 2];
+      const n = Math.hypot(nx, ny, nz) || 1;
+      const cos = (nx * lx + ny * ly + nz * lz) / n;
+      // A floor keeps surfaces facing away from the light readable rather than
+      // black (the client's own floor is lightness 2/127).
+      const factor = Math.max(MIN_LIGHT_FACTOR, (ambient + strength * cos) / 128);
+      const [h, s, l] = rgbToHsl(this.colors[v * 4], this.colors[v * 4 + 1], this.colors[v * 4 + 2]);
+      const [r, g, b] = hslToRgb(h, s, Math.min(126 / 127, Math.max(2 / 127, l * factor)));
+      this.colors[v * 4] = r;
+      this.colors[v * 4 + 1] = g;
+      this.colors[v * 4 + 2] = b;
+    }
     return this;
   }
 
@@ -190,6 +409,7 @@ export class RigModel {
   }
 
   part(label, builder, x, y, z, parent = this.root) {
+    builder.bakeLighting(this.lighting ?? {});
     const mesh = builder.applyTo(new this.ctors.Mesh(`${this.name}-${label}`, this.scene));
     mesh.material = this.material;
     mesh.isPickable = false;

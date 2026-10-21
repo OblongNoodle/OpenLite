@@ -25,6 +25,7 @@ const SAMPLE_REGIONS = {
   skin: [[27, 16, 37, 25]],
   beard: [[29, 22, 35, 28]],
   torso: [[22, 36, 42, 60]],
+  belt: [[22, 63, 42, 67]],
   sleeve: [[9, 32, 18, 40], [46, 32, 55, 40]],
   forearm: [[9, 50, 16, 62], [48, 50, 55, 62]],
   hand: [[9, 68, 16, 78], [48, 68, 55, 78]],
@@ -39,6 +40,7 @@ export const DEFAULT_COLORS = {
   skin: [0.85, 0.6, 0.42],
   beard: [0.85, 0.6, 0.42],
   torso: [0.55, 0.15, 0.12],
+  belt: [0.3, 0.2, 0.12],
   sleeve: [0.55, 0.15, 0.12],
   forearm: [0.85, 0.6, 0.42],
   hand: [0.85, 0.6, 0.42],
@@ -47,6 +49,11 @@ export const DEFAULT_COLORS = {
 };
 
 const DARK = [0.08, 0.06, 0.06];
+
+// Joint heights and shoulder spacing of the humanoid rig (2 units tall).
+const LAYOUT = { hipY: 0.98, shoulderY: 1.55, neckY: 1.62, shoulderX: 0.2 };
+// Heads are modelled at about 0.5 units tall and scaled down to OSRS size.
+const HEAD_SCALE = 0.62;
 const BONE = [0.86, 0.82, 0.7];
 const LEG_SWING = 0.6;
 const ARM_SWING = 0.5;
@@ -255,37 +262,82 @@ function buildHead(c, gear, variant) {
         .box(0.06, 0.2, 0.06, 0.12, 0.45, -0.02, shade(c.skin, 0.6), -0.3, -0.35);
   }
 
-  // Neck, then a rounded head: narrow chin, full cheeks, rounded crown.
-  head.lathe([[0, 0.05, 0.05], [0.08, 0.055, 0.055]], 6, 0, 0, 0, c.skin)
-    .lathe([[0.05, 0.075, 0.07], [0.1, 0.12, 0.115], [0.18, 0.148, 0.142], [0.3, 0.15, 0.144], [0.38, 0.12, 0.118], [0.43, 0.06, 0.06]], 8, 0, 0, 0, c.skin)
-    .box(0.045, 0.06, 0.05, 0, 0.215, 0.15, shade(c.skin, 0.92))
-    .box(0.045, 0.035, 0.02, -0.06, 0.255, 0.137, DARK)
-    .box(0.045, 0.035, 0.02, 0.06, 0.255, 0.137, DARK)
-    .box(0.07, 0.016, 0.02, 0, 0.15, 0.14, shade(c.skin, 0.7));
+  // Neck, then the head: chin forward, square jaw, cheekbones, brow, crown.
+  head.loft([{ t: -0.02, w: 0.058, f: 0.055, b: 0.06 }, { t: 0.08, w: 0.06, f: 0.055, b: 0.065 }], 8, 0, 0, -0.01, c.skin)
+    .loft([
+      { t: 0.05, w: 0.07, f: 0.13, b: 0.05, oz: 0.0, n: 2.6 },
+      { t: 0.1, w: 0.115, f: 0.145, b: 0.09, n: 2.7 },
+      { t: 0.18, w: 0.142, f: 0.15, b: 0.135, n: 2.6 },
+      { t: 0.27, w: 0.15, f: 0.152, b: 0.15, n: 2.5 },
+      { t: 0.35, w: 0.145, f: 0.14, b: 0.15 },
+      { t: 0.42, w: 0.115, f: 0.105, b: 0.12 },
+      { t: 0.465, w: 0.05, f: 0.045, b: 0.055 }
+    ], 12, 0, 0, -0.01, c.skin)
+    // Nose: a wedge widening toward its base.
+    .loft([{ t: 0.0, w: 0.016, f: 0.012, b: 0.012 }, { t: 0.05, w: 0.026, f: 0.022, b: 0.014 }, { t: 0.075, w: 0.032, f: 0.03, b: 0.012 }], 6, 0, 0.19, 0.145, shade(c.skin, 0.95), { tiltX: -0.25 })
+    // Brow ridge over inset eyes, and a mouth.
+    .loft([{ t: -0.1, w: 0.012, f: 0.014, b: 0.01 }, { t: 0.1, w: 0.012, f: 0.014, b: 0.01 }], 6, 0, 0.29, 0.14, shade(c.skin, 0.9), { tiltZ: Math.PI / 2 })
+    .box(0.042, 0.028, 0.02, -0.058, 0.258, 0.138, DARK)
+    .box(0.042, 0.028, 0.02, 0.058, 0.258, 0.138, DARK)
+    .box(0.075, 0.014, 0.02, 0, 0.135, 0.135, shade(c.skin, 0.65))
+    // Ears.
+    .blob([0.02, 0.045, 0.03], -0.15, 0.24, -0.01, shade(c.skin, 0.95), { roughness: 0.05, sides: 8, rings: 5 })
+    .blob([0.02, 0.045, 0.03], 0.15, 0.24, -0.01, shade(c.skin, 0.95), { roughness: 0.05, sides: 8, rings: 5 });
   if (colorDistance(c.beard, c.skin) > SAME_COLOR_DISTANCE) {
-    // A full beard around the jaw and chin.
-    head.lathe([[0.05, 0.08, 0.075], [0.11, 0.135, 0.13], [0.19, 0.152, 0.146]], 8, 0, -0.01, 0.012, c.beard)
-      .box(0.14, 0.04, 0.04, 0, 0.185, 0.145, c.beard);
+    // A full beard following the jaw, thickest at the chin.
+    head.loft([
+      { t: 0.03, w: 0.055, f: 0.14, b: 0.04 },
+      { t: 0.09, w: 0.12, f: 0.155, b: 0.09 },
+      { t: 0.16, w: 0.148, f: 0.153, b: 0.13 }
+    ], 12, 0, -0.005, -0.006, c.beard)
+      .box(0.1, 0.03, 0.03, 0, 0.165, 0.15, c.beard);
   }
   const helmet = gear[EquipSlot.Helmet];
   if (helmet) {
-    // A domed helm covering the crown, sides and back of the head.
     const metal = helmet.color;
-    head.lathe([[0.17, 0.163, 0.158], [0.31, 0.165, 0.16], [0.4, 0.14, 0.135], [0.46, 0.08, 0.08], [0.49, 0.02, 0.02]], 8, 0, 0, -0.003, metal);
+    // A dome over the crown down to the brow.
+    head.loft([
+      { t: 0.29, w: 0.168, f: 0.164, b: 0.172, n: 2.6 },
+      { t: 0.37, w: 0.168, f: 0.158, b: 0.172 },
+      { t: 0.44, w: 0.14, f: 0.13, b: 0.148 },
+      { t: 0.5, w: 0.06, f: 0.055, b: 0.065 }
+    ], 12, 0, 0, -0.01, metal);
     if (helmet.coversFace) {
-      head.box(0.27, 0.26, 0.04, 0, 0.25, 0.15, metal)
-        .box(0.2, 0.03, 0.01, 0, 0.27, 0.172, DARK)
-        .box(0.03, 0.12, 0.01, 0, 0.2, 0.172, DARK);
+      // A full helm closes the front too, leaving eye and breathing slits.
+      head.loft([
+        { t: 0.06, w: 0.13, f: 0.16, b: 0.1, n: 2.8 },
+        { t: 0.18, w: 0.16, f: 0.165, b: 0.15, n: 2.8 },
+        { t: 0.3, w: 0.168, f: 0.166, b: 0.172, n: 2.6 }
+      ], 12, 0, 0, -0.01, metal)
+        .box(0.2, 0.026, 0.02, 0, 0.255, 0.165, DARK)
+        .box(0.026, 0.11, 0.02, 0, 0.17, 0.168, DARK);
     } else {
-      head.box(0.035, 0.12, 0.03, 0, 0.3, 0.168, metal);
+      // A medium helm: plates down the sides and back framing an open face,
+      // and a nose guard.
+      head.loft([
+        { t: 0.12, w: 0.15, f: 0.03, b: 0.1, oz: -0.06 },
+        { t: 0.22, w: 0.168, f: 0.05, b: 0.115, oz: -0.06 },
+        { t: 0.31, w: 0.17, f: 0.06, b: 0.11, oz: -0.06 }
+      ], 12, 0, 0, -0.01, metal)
+        .box(0.032, 0.12, 0.03, 0, 0.255, 0.168, metal);
     }
-    if (helmet.trim) head.lathe([[0.3, 0.168, 0.163], [0.33, 0.168, 0.163]], 8, 0, 0, -0.003, helmet.trim);
+    if (helmet.trim) head.loft([{ t: 0.3, w: 0.172, f: 0.168, b: 0.176 }, { t: 0.33, w: 0.172, f: 0.166, b: 0.176 }], 12, 0, 0, -0.01, helmet.trim);
   } else {
-    // Hair: a cap over the crown and down the back of the head.
-    head.lathe([[0.31, 0.156, 0.15], [0.37, 0.14, 0.135], [0.43, 0.1, 0.096], [0.465, 0.045, 0.045]], 8, 0, 0, -0.008, c.hair)
-      .box(0.3, 0.24, 0.05, 0, 0.25, -0.125, c.hair)
-      .box(0.04, 0.16, 0.2, -0.15, 0.27, -0.03, c.hair)
-      .box(0.04, 0.16, 0.2, 0.15, 0.27, -0.03, c.hair);
+    // Hair: a chunky cap from a fringe above the brow, over the crown and down
+    // the back of the head, slightly larger than the skull beneath.
+    head.loft([
+      { t: 0.32, w: 0.166, f: 0.162, b: 0.172, n: 2.6 },
+      { t: 0.38, w: 0.165, f: 0.155, b: 0.172 },
+      { t: 0.44, w: 0.138, f: 0.126, b: 0.146 },
+      { t: 0.49, w: 0.07, f: 0.064, b: 0.076 }
+    ], 12, 0, 0, -0.01, c.hair)
+      .loft([
+        { t: 0.12, w: 0.14, f: 0.03, b: 0.07, oz: -0.11 },
+        { t: 0.22, w: 0.163, f: 0.05, b: 0.09, oz: -0.1 },
+        { t: 0.34, w: 0.166, f: 0.07, b: 0.085, oz: -0.09 }
+      ], 10, 0, 0, -0.01, c.hair)
+      .box(0.03, 0.13, 0.17, -0.155, 0.27, -0.035, c.hair)
+      .box(0.03, 0.13, 0.17, 0.155, 0.27, -0.035, c.hair);
   }
   return head;
 }
@@ -299,61 +351,110 @@ export class HumanModel extends RigModel {
     this.build(spec);
   }
 
+  // OSRS proportions (2 units tall): long legs with the belt at half height,
+  // a slim torso, narrow shoulders, arms hanging close, a small head.
   build({ colors: c, gear }) {
-    const hipY = 0.82;
-    const shoulderY = 1.36;
-    const neckY = 1.4;
+    const { hipY, shoulderY, neckY, shoulderX } = LAYOUT;
     const chest = gear[EquipSlot.Chest];
     const legs = gear[EquipSlot.Legs];
     const isGhost = this.variant === "ghost";
 
-    // Legs taper from thigh to ankle and end in a boot. Ghosts have no visible
-    // legs: the robe reaches the ground instead.
+    // Legs: thigh, knee, calf, ankle, then a compact boot with its toe forward.
+    // Ghosts have no visible legs: the robe reaches the ground instead.
+    const legColor = isGhost ? c.torso : c.legs, bootColor = isGhost ? c.torso : c.feet;
     const leg = () => new GeometryBuilder()
-      .lathe([[0.02, 0.1, 0.105], [-0.2, 0.092, 0.098], [-0.4, 0.074, 0.082], [-0.66, 0.064, 0.07]], 6, 0, 0, 0, isGhost ? c.torso : c.legs)
-      .lathe([[-0.64, 0.072, 0.08], [-0.74, 0.082, 0.105], [-0.82, 0.084, 0.118]], 6, 0, 0, 0.03, isGhost ? c.torso : c.feet);
-    this.leftLeg = this.part("leg-l", leg(), -0.1, hipY, 0);
-    this.rightLeg = this.part("leg-r", leg(), 0.1, hipY, 0);
+      .loft([
+        { t: 0.03, w: 0.088, f: 0.085, b: 0.092 },
+        { t: -0.15, w: 0.08, f: 0.08, b: 0.085 },
+        { t: -0.38, w: 0.062, f: 0.066, b: 0.06 },
+        { t: -0.44, w: 0.06, f: 0.064, b: 0.062, oz: 0.003 },
+        { t: -0.56, w: 0.057, f: 0.056, b: 0.07, oz: -0.004 },
+        { t: -0.7, w: 0.05, f: 0.05, b: 0.055 },
+        { t: -0.8, w: 0.043, f: 0.045, b: 0.046 }
+      ], 10, 0, 0, 0, legColor)
+      .loft([
+        { t: -0.77, w: 0.05, f: 0.054, b: 0.054, n: 2.6 },
+        { t: -0.87, w: 0.055, f: 0.06, b: 0.06, n: 2.6 },
+        { t: -0.93, w: 0.06, f: 0.1, b: 0.064, n: 2.8 },
+        { t: -0.98, w: 0.058, f: 0.108, b: 0.062, n: 3 }
+      ], 10, 0, 0, 0.008, bootColor);
+    this.leftLeg = this.part("leg-l", leg(), -0.075, hipY, 0);
+    this.rightLeg = this.part("leg-r", leg(), 0.075, hipY, 0);
 
-    // Torso: narrow waist, broad chest, sloping shoulders up to the neck.
+    // Torso: a tunic hem over the trousers, a belt, a slim waist, chest and
+    // shoulders, and the base of the neck.
     const torso = new GeometryBuilder()
-      .lathe([[-0.02, 0.19, 0.12], [0.12, 0.19, 0.122], [0.3, 0.215, 0.135], [0.44, 0.235, 0.14], [0.53, 0.2, 0.125], [0.58, 0.09, 0.075]], 8, 0, 0, 0, c.torso)
-      .lathe([[-0.04, 0.198, 0.128], [0.04, 0.2, 0.13]], 8, 0, 0, 0, c.legs);
+      .loft([
+        { t: -0.07, w: 0.152, f: 0.1, b: 0.1, n: 2.5 },
+        { t: 0.1, w: 0.135, f: 0.085, b: 0.08, n: 2.5 },
+        { t: 0.33, w: 0.158, f: 0.105, b: 0.088, n: 2.6 },
+        { t: 0.5, w: 0.178, f: 0.098, b: 0.09, n: 2.7 },
+        { t: 0.58, w: 0.155, f: 0.083, b: 0.083, n: 2.5 },
+        { t: 0.64, w: 0.065, f: 0.05, b: 0.055 }
+      ], 12, 0, 0, 0, c.torso)
+      .loft([
+        { t: -0.025, w: 0.148, f: 0.097, b: 0.097, n: 2.6 },
+        { t: 0.035, w: 0.142, f: 0.092, b: 0.092, n: 2.6 }
+      ], 12, 0, 0, 0, c.belt);
     if (isGhost) {
-      torso.lathe([[0, 0.21, 0.14], [-0.4, 0.25, 0.18], [-0.8, 0.29, 0.21]], 8, 0, 0, 0, c.torso);
+      torso.lathe([[0, 0.16, 0.11], [-0.5, 0.2, 0.15], [-0.96, 0.24, 0.18]], 8, 0, 0, 0, c.torso);
     } else if (legs?.isSkirt || hasWord(legs?.name || "", "skirt", "robe")) {
-      torso.lathe([[0, 0.205, 0.135], [-0.44, 0.255, 0.185]], 8, 0, 0, 0, c.legs);
+      torso.lathe([[0, 0.15, 0.1], [-0.5, 0.2, 0.15]], 8, 0, 0, 0, c.legs);
     }
-    if (chest?.trim) torso.box(0.06, 0.48, 0.02, 0, 0.27, 0.135, chest.trim);
+    if (chest?.trim) torso.box(0.05, 0.42, 0.02, 0, 0.3, 0.1, chest.trim);
     const neck = gear[EquipSlot.Neck];
-    if (neck) torso.box(0.07, 0.07, 0.02, 0, 0.44, 0.14, neck.color);
+    if (neck) torso.box(0.05, 0.05, 0.02, 0, 0.52, 0.1, neck.color);
     this.torso = this.part("torso", torso, 0, hipY, 0);
 
     const back = gear[EquipSlot.Back];
     if (back) {
-      // A cape flaring out slightly towards the hem.
+      // A cape hanging from the shoulders, flaring slightly toward the hem.
       this.part("cape", new GeometryBuilder()
-        .box(0.4, 0.3, 0.03, 0, -0.15, 0, back.color, -0.06)
-        .box(0.46, 0.46, 0.03, 0, -0.52, -0.02, back.color, -0.1), 0, 0.56, -0.15, this.torso);
+        .box(0.3, 0.36, 0.025, 0, -0.18, 0, back.color, -0.05)
+        .box(0.36, 0.5, 0.025, 0, -0.6, -0.02, back.color, -0.08), 0, 0.6, -0.1, this.torso);
     }
 
+    // Arms: shoulder, upper arm in the sleeve to the elbow, slim forearm, and a
+    // small hand with a thumb on the inner side.
     const arm = (isLeft) => {
+      const inner = isLeft ? 1 : -1;
       const g = new GeometryBuilder()
-        .lathe([[0.03, 0.078, 0.08], [-0.2, 0.066, 0.07]], 6, 0, 0, 0, c.sleeve)
-        .lathe([[-0.19, 0.06, 0.064], [-0.4, 0.05, 0.054]], 6, 0, 0, 0, c.forearm)
-        .lathe([[-0.39, 0.052, 0.058], [-0.46, 0.058, 0.066], [-0.53, 0.038, 0.048]], 6, 0, 0, 0, c.hand);
+        .loft([
+          { t: 0.05, w: 0.035, f: 0.035, b: 0.035 },
+          { t: 0.01, w: 0.057, f: 0.056, b: 0.058 },
+          { t: -0.12, w: 0.053, f: 0.05, b: 0.05 },
+          { t: -0.27, w: 0.046, f: 0.046, b: 0.046 }
+        ], 10, 0, 0, 0, c.sleeve)
+        .loft([
+          { t: -0.25, w: 0.04, f: 0.04, b: 0.04 },
+          { t: -0.33, w: 0.043, f: 0.043, b: 0.041 },
+          { t: -0.5, w: 0.032, f: 0.032, b: 0.03 }
+        ], 10, 0, 0, 0, c.forearm)
+        .loft([
+          { t: -0.49, w: 0.033, f: 0.033, b: 0.03, n: 2.8 },
+          { t: -0.55, w: 0.037, f: 0.044, b: 0.032, n: 3 },
+          { t: -0.61, w: 0.036, f: 0.042, b: 0.03, n: 3 },
+          { t: -0.65, w: 0.025, f: 0.03, b: 0.022, n: 2.8 }
+        ], 10, 0, 0, 0.003, c.hand)
+        .loft([
+          { t: 0, w: 0.013, f: 0.014, b: 0.013 },
+          { t: -0.045, w: 0.011, f: 0.012, b: 0.011 }
+        ], 6, inner * 0.03, -0.54, 0.025, c.hand, { tiltX: 0.5, tiltZ: inner * 0.5 });
       if (chest && hasWord(chest.name, "plate")) {
-        g.lathe([[-0.06, 0.11, 0.12], [0.03, 0.105, 0.115], [0.08, 0.055, 0.06]], 8, isLeft ? -0.015 : 0.015, 0, 0, chest.color);
+        g.lathe([[-0.05, 0.07, 0.075], [0.03, 0.066, 0.07], [0.06, 0.035, 0.04]], 8, isLeft ? -0.01 : 0.01, 0, 0, chest.color);
       }
       return g;
     };
-    this.leftArm = this.part("arm-l", arm(true), -0.3, shoulderY, 0);
-    this.rightArm = this.part("arm-r", arm(false), 0.3, shoulderY, 0);
+    this.leftArm = this.part("arm-l", arm(true), -shoulderX, shoulderY, 0);
+    this.rightArm = this.part("arm-r", arm(false), shoulderX, shoulderY, 0);
+    // Arms hang slightly away from the body.
+    this.leftArm.rotation.z = -0.06;
+    this.rightArm.rotation.z = 0.06;
 
     const weapon = gear[EquipSlot.Weapon];
     if (weapon) {
       // Held just outside the fist so the head clears the arm and torso.
-      const mesh = this.part("weapon", buildWeapon(weapon), 0.06, -0.47, 0.05, this.rightArm);
+      const mesh = this.part("weapon", buildWeapon(weapon), 0.04, -0.6, 0.03, this.rightArm);
       mesh.rotation.x = weaponTilt(weapon.name);
     }
     const shield = gear[EquipSlot.Shield];
@@ -369,10 +470,13 @@ export class HumanModel extends RigModel {
           .box(0.05, 0.44, 0.04, 0, 0, 0.18, rim)
           .box(0.05, 0.44, 0.04, 0, 0, -0.18, rim);
       }
-      this.part("shield", g, -0.1, -0.32, 0.02, this.leftArm);
+      this.part("shield", g, -0.07, -0.42, 0.02, this.leftArm);
     }
 
     this.head = this.part("head", buildHead(c, gear, this.variant), 0, neckY, 0);
+    // The head is modelled large for detail and scaled to OSRS size here.
+    const headScale = this.variant ? 0.72 : HEAD_SCALE;
+    this.head.scaling.set(headScale, headScale, headScale);
   }
 
   // pose: { moving, activity, strike } where strike is the 0-1 progress of the
@@ -437,9 +541,9 @@ export class HumanModel extends RigModel {
     this.rightArm.rotation.x = this.rightArmAngle;
     this.leftArm.rotation.x = this.leftArmAngle;
     this.torso.rotation.x = this.head.rotation.x = this.lean;
-    this.torso.position.y = 0.82 + bob;
-    this.head.position.y = 1.4 + bob;
-    this.leftArm.position.y = this.rightArm.position.y = 1.36 + bob;
+    this.torso.position.y = LAYOUT.hipY + bob;
+    this.head.position.y = LAYOUT.neckY + bob;
+    this.leftArm.position.y = this.rightArm.position.y = LAYOUT.shoulderY + bob;
 
     // Fall backwards onto the ground when dead.
     const lying = this.updateLying(pose.activity === Activity.Dead, deltaMs);
