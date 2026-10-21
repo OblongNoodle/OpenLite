@@ -27,6 +27,11 @@ declare global {
         };
         screenshot: {
             capture: () => Promise<{ ok: boolean; path?: string; error?: string }>;
-        }
+        };
+        osrsCache: {
+            open: (dir?: string) => Promise<{ ok: boolean; dir?: string; error?: string }>;
+            archives: (index: number) => Promise<number[] | null>;
+            files: (index: number, archive: number) => Promise<{ id: number; data: Uint8Array }[] | null>;
+        };
     }
 }

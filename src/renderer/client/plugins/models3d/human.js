@@ -138,7 +138,11 @@ export async function loadHumanSpec(spritesheetInfo, getItemName) {
   }
 
   const sheet = await loadImage(spritesheetInfo.SpritesheetURL);
-  return { colors: sampleBodyColors(readCell(sheet, 0, 0, CELL_WIDTH, CELL_HEIGHT), mask), gear };
+  return {
+    colors: sampleBodyColors(readCell(sheet, 0, 0, CELL_WIDTH, CELL_HEIGHT), mask),
+    gear,
+    appearanceIds: spritesheetInfo.AppearanceIDs
+  };
 }
 
 // Humanoid creatures share the human rig; their colours come from their own

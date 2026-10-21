@@ -10,6 +10,8 @@ import { DEFAULT_COLORS, HumanModel, humanoidCreatureFor, loadHumanSpec, loadHum
 import { CreatureModel, creatureFamilyFor, loadCreatureSpec } from "./models3d/creatures.js";
 import { ITEM_SIZE, itemYaw, loadItemGeometry } from "./models3d/items.js";
 import { buildScenery, loadSceneryColors, sceneryKindFor } from "./models3d/scenery.js";
+import { OsrsCache, OsrsPlayerModel, buildPlayerData } from "./models3d/osrs/player.js";
+import { ActionState } from "@highlite/core";
 
 // Model specs are cached per sprite so identical NPCs share one analysis.
 const MAX_CACHED_SPECS = 256;
@@ -75,6 +77,12 @@ var Models3D = class extends Plugin {
     this.itemSources ??= new Map();
     this.sceneryRecords ??= new Map();
     this.settings.scenery ??= { text: "3D trees, rocks and bushes", type: SettingsTypes.checkbox, value: true, callback: () => {} };
+    this.settings.osrsCharacters ??= { text: "OSRS character models (needs RuneLite's OSRS cache)", type: SettingsTypes.checkbox, value: true, callback: () => {} };
+    // Players are built from the local OSRS cache when it is available.
+    this.osrsCache = OsrsCache.open().catch((error) => {
+      this.warn("OSRS cache not available; using generated characters", error);
+      return null;
+    });
     this.settings.creatures ??= { text: "3D creatures", type: SettingsTypes.checkbox, value: true, callback: () => {} };
     this.settings.groundItems ??= { text: "3D ground items", type: SettingsTypes.checkbox, value: true, callback: () => {} };
     this.attachRenderObserver();
@@ -90,7 +98,7 @@ var Models3D = class extends Plugin {
     this.clearScenery();
     // Specs are cheap to rebuild and may come from older code after a hot swap.
     this.specCache.clear();
-    for (const key of ["material", "translucentMaterial"]) {
+    for (const key of ["material", "translucentMaterial", "osrsMaterial"]) {
       this[key]?.dispose();
       this[key] = null;
     }
@@ -226,7 +234,7 @@ var Models3D = class extends Plugin {
     const light = this.gameHooks.AtmosphereManager?.Instance?.HemisphericLight;
     if (!light) return;
     const level = (channel) => Math.min(1, Math.max(0.45, light.diffuse[channel] * light.intensity * 1.1));
-    for (const material of [this.material, this.translucentMaterial]) {
+    for (const material of [this.material, this.translucentMaterial, this.osrsMaterial]) {
       material?.emissiveColor.set(level("r"), level("g"), level("b"));
     }
   }
@@ -266,6 +274,7 @@ var Models3D = class extends Plugin {
       const pose = {
         moving: entity.IsMoving,
         activity,
+        woodcutting: state === ActionState.WoodcuttingState,
         strike: strikeElapsed < STRIKE_DURATION_MS ? strikeElapsed / STRIKE_DURATION_MS : null
       };
 
@@ -522,7 +531,35 @@ var Models3D = class extends Plugin {
         : new HumanModel(this.scene, this.ctors, material, spec ?? { colors: DEFAULT_COLORS, gear: {} }, name);
       if (record.model) record.model.yaw = previousYaw;
       record.spec = spec;
+      if (record.type.kind === "human" && spec && this.settings.osrsCharacters.value) this.upgradeToOsrsModel(record, key, name);
     });
+  }
+
+  // Swaps a human's generated model for one built from the OSRS cache once
+  // its kit and equipment models have loaded.
+  async upgradeToOsrsModel(record, key, name) {
+    const cache = await this.osrsCache;
+    if (!cache) return;
+    try {
+      const data = await buildPlayerData(cache, record.spec.appearanceIds, record.spec.colors, record.spec.gear);
+      if (record.specKey !== key || this.records.get(record.entity) !== record) return;
+      const previousYaw = record.model?.yaw ?? null;
+      record.model?.dispose();
+      record.model = new OsrsPlayerModel(this.scene, this.ctors, this.getOsrsMaterial(), data, cache, name);
+      record.model.yaw = previousYaw;
+    } catch (error) {
+      this.error("Building OSRS player failed", error);
+    }
+  }
+
+  // OSRS models are lit into their colours like the others, and drawn
+  // two-sided because the client does not cull by winding the same way.
+  getOsrsMaterial() {
+    if (this.osrsMaterial) return this.osrsMaterial;
+    const material = this.getMaterial().clone("models3d-osrs-material");
+    material.backFaceCulling = false;
+    this.osrsMaterial = material;
+    return material;
   }
 
   disposeRecord(record) {

@@ -30,11 +30,20 @@ const screenshotAPI = {
     capture: async () => ipcRenderer.invoke('screenshot:capture') as Promise<{ ok: boolean; path?: string; error?: string }>,
 };
 
+// Read-only access to a local Jagex game cache (see main/modules/osrsCache).
+const osrsCacheAPI = {
+    open: async (dir?: string) => ipcRenderer.invoke('osrs-cache:open', dir) as Promise<{ ok: boolean; dir?: string; error?: string }>,
+    archives: async (index: number) => ipcRenderer.invoke('osrs-cache:archives', index) as Promise<number[] | null>,
+    files: async (index: number, archive: number) =>
+        ipcRenderer.invoke('osrs-cache:files', index, archive) as Promise<{ id: number; data: Uint8Array }[] | null>,
+};
+
 if (process.contextIsolated) {
     try {
         contextBridge.exposeInMainWorld('electron', electronAPI);
         contextBridge.exposeInMainWorld('settings', settingsAPI);
         contextBridge.exposeInMainWorld('screenshot', screenshotAPI);
+        contextBridge.exposeInMainWorld('osrsCache', osrsCacheAPI);
     } catch (error) {
         console.error(error);
     }
@@ -45,4 +54,6 @@ if (process.contextIsolated) {
     window.settings = settingsAPI;
     // @ts-ignore
     window.screenshot = screenshotAPI;
+    // @ts-ignore
+    window.osrsCache = osrsCacheAPI;
 }
