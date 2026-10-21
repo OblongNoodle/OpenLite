@@ -25,6 +25,11 @@ log.initialize({ spyRendererConsole: true });
 log.transports.console.level = 'info';
 log.transports.file.level = 'debug';
 
+// Unpackaged dev builds use their own profile so they can run alongside an installed HighLite.
+if (!app.isPackaged) {
+    app.setPath('userData', app.getPath('userData') + '-Dev');
+}
+
 const gotTheLock = app.requestSingleInstanceLock();
 if (!gotTheLock) {
     app.quit();
