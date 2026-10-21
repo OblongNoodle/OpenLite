@@ -292,10 +292,12 @@ var Models3D = class extends Plugin {
       } else if (record.model instanceof OsrsPlayerModel) {
         // OSRS models fit the space the sprite's figure takes up: creatures'
         // proportions are measured from their sprites; people fill the height.
+        // People fit by height alone: tools and staffs they hold can make
+        // their models long.
         const spec = record.spec;
         record.model.update(position, appearance.CurrentDirection, pose, {
           height: appearance.Height * (spec?.heightFraction ?? 0.95),
-          length: appearance.Width * (spec?.lengthFraction ?? 1)
+          length: record.type.kind === "human" ? Infinity : appearance.Width * (spec?.lengthFraction ?? 1)
         }, deltaMs);
       } else {
         record.model.update(position, appearance.CurrentDirection, pose, appearance.Height / 2, deltaMs);
