@@ -13,8 +13,10 @@
 //   everywhere, so the light changes from corner to corner, and that is what
 //   gives OSRS ground its mottled look. The game's land is nearly flat, so the
 //   same noise is added for lighting only (the ground stays where it is).
-// - Overlays (paths, floors) are one flat colour per tile, lit per corner,
-//   and are tile shapes: full squares, plus the half of a grass tile cut
+// - Overlays (paths, floors) shade between corners like underlays and stone
+//   overlays carry an OSRS texture (lit per corner, as the client lights
+//   textured tiles). They
+//   are tile shapes: full squares, plus the half of a grass tile cut
 //   corner to corner where a path steps, so their edges are straight lines.
 //
 // The game gives us one painted colour per tile with roads already in it.
@@ -42,8 +44,14 @@ const LIGHT_DIVISOR = 214;
 const FLAT_LIGHTNESS = 86;
 // RS units per tile, for converting our heights to the client's scale.
 const RS_UNITS_PER_TILE = 128;
-// Tiles below this alpha are holes in the ground (water shows through).
+// Tiles below this alpha are holes in the game's ground (water shows
+// through); ours has a bed there, this colour where nothing borders it.
 const HOLE_ALPHA = 130;
+const WATER_BED = [0.09, 0.3, 0.26];
+// OSRS texture on stone overlays (paving), and the lightness of a textured
+// tile on flat ground (the texture carries the colour).
+export const STONE_TEXTURE = 43;
+const TEXTURED_LIGHTNESS = 0.82;
 // The client's made-up heights: getTileHeight's 10-60 times 8 RS units.
 const NOISE_HEIGHT_SCALE = 8;
 // Underlay variation: hue and lightness drift over patches this many tiles
@@ -117,6 +125,16 @@ function surfaceOf(r, g, b) {
   if (max - min < 0.07) return "stone";
   if (g >= r && g > b) return "grass";
   return "earth";
+}
+
+// Each tile's surface ("grass", "earth", "stone"), or null for holes, from the
+// game's ground colours ({ pixels, width, height }, one pixel per tile).
+export function tileSurfaces(colors) {
+  return Array.from({ length: colors.width * colors.height }, (_, i) => {
+    const p = i * 4;
+    if (colors.pixels[p + 3] < HOLE_ALPHA) return null;
+    return surfaceOf(colors.pixels[p] / 255, colors.pixels[p + 1] / 255, colors.pixels[p + 2] / 255);
+  });
 }
 
 function hash(x, y) {
@@ -272,7 +290,8 @@ function smoothOutline(overlay, solid, tilesX, tilesY) {
 //     down the image), so the height noise lines up across regions.
 //   tileVisibility: 0-1, strength of the height noise in the lighting (0.5
 //     is the client's own), which makes the tiles more or less visible.
-// Returns vertex data in the ground's space: positions, colors (RGBA), indices.
+// Returns vertex data in the ground's space (positions, colors as RGBA,
+// indices), and the same plus uvs for the textured part (textured).
 export function buildOsrsGround(colors, cornerPosition, worldOrigin, tileVisibility = 0.5) {
   const tilesX = colors.width, tilesY = colors.height;
   const cornersX = tilesX + 1;
@@ -350,16 +369,30 @@ export function buildOsrsGround(colors, cornerPosition, worldOrigin, tileVisibil
     }
   }
 
-  const positions = [], vertexColors = [];
+  const plain = { positions: [], colors: [] };
+  const textured = { positions: [], colors: [], uvs: [] };
   const vertex = ([cx, cy], hsl) => {
-    positions.push(...cornerPosition(cx, cy));
+    plain.positions.push(...cornerPosition(cx, cy));
     const light = cornerLight[cy * cornersX + cx];
     const [r, g, b] = hslToRgb(...toHsl16(hsl[0], hsl[1], Math.min(0.99, Math.max(0.01, hsl[2] * light))));
-    vertexColors.push(r, g, b, 1);
+    plain.colors.push(r, g, b, 1);
   };
+  // Textured corners carry only the light; the texture repeats once per tile.
+  const texturedVertex = ([cx, cy]) => {
+    textured.positions.push(...cornerPosition(cx, cy));
+    const light = Math.min(1, TEXTURED_LIGHTNESS * cornerLight[cy * cornersX + cx]);
+    textured.colors.push(light, light, light, 1);
+    textured.uvs.push(worldOrigin.x + cx, worldOrigin.y + cy);
+  };
+  const stone = (i) => i >= 0 && i < surfaces.length && painted[i] && surfaces[i] === "stone";
   // A triangle of overlay or underlay, coloured per corner (the other kind's
-  // colour, then the tile's own, where a corner has none of its kind).
-  const triangle = (corners, asOverlay, i) => {
+  // colour, then the tile's own, where a corner has none of its kind). Stone
+  // overlay (from the tile `source`) is textured instead.
+  const triangle = (corners, asOverlay, i, source = i) => {
+    if (asOverlay && stone(source)) {
+      for (const corner of corners) texturedVertex(corner);
+      return;
+    }
     for (const [cx, cy] of corners) {
       const c = cy * cornersX + cx;
       vertex([cx, cy], (asOverlay ? cornerOver[c] ?? cornerUnder[c] : cornerUnder[c] ?? cornerOver[c]) ?? own[i]);
@@ -380,9 +413,17 @@ export function buildOsrsGround(colors, cornerPosition, worldOrigin, tileVisibil
   for (let ty = 0; ty < tilesY; ty++) {
     for (let tx = 0; tx < tilesX; tx++) {
       const i = ty * tilesX + tx;
-      if (!solid[i]) continue;
-      const self = overlay[i];
       const corners = { NW: [tx, ty], NE: [tx + 1, ty], SW: [tx, ty + 1], SE: [tx + 1, ty + 1] };
+      if (!solid[i]) {
+        // Water: the ground goes on under it as a bed (the water plane covers
+        // it), so sloping banks show earth rather than a gap.
+        for (const corner of [corners.NW, corners.NE, corners.SW, corners.NE, corners.SE, corners.SW]) {
+          const c = corner[1] * cornersX + corner[0];
+          vertex(corner, cornerUnder[c] ?? cornerOver[c] ?? WATER_BED);
+        }
+        continue;
+      }
+      const self = overlay[i];
       // Neighbours of the other kind, by side.
       const n = isOverlay(tx, ty - 1, self) !== self, s = isOverlay(tx, ty + 1, self) !== self;
       const w = isOverlay(tx - 1, ty, self) !== self, e = isOverlay(tx + 1, ty, self) !== self;
@@ -402,11 +443,15 @@ export function buildOsrsGround(colors, cornerPosition, worldOrigin, tileVisibil
         triangle([corners.NE, corners.SE, corners.SW], self, i);
         continue;
       }
+      // The corner half is path from the tile beside it (north or south).
       const [cornerHalf, rest] = HALVES[corner](corners);
-      triangle(cornerHalf, !self, i);
+      triangle(cornerHalf, !self, i, (ty + (corner[0] === "N" ? -1 : 1)) * tilesX + tx);
       triangle(rest, self, i);
     }
   }
-  const indices = Array.from({ length: positions.length / 3 }, (_, k) => k);
-  return { positions, colors: vertexColors, indices };
+  const indices = (data) => Array.from({ length: data.positions.length / 3 }, (_, k) => k);
+  return {
+    positions: plain.positions, colors: plain.colors, indices: indices(plain),
+    textured: { ...textured, indices: indices(textured), textureId: STONE_TEXTURE }
+  };
 }

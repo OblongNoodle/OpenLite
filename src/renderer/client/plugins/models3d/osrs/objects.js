@@ -4,7 +4,7 @@
 import { lightModel, mergeModels, recolor, rsColorToRgb } from "./player.js";
 
 // Shapes an object can be placed as (the client's LocShape).
-export const LocShape = { WallStraight: 0, WallDiagonal: 9, Centrepiece: 10 };
+export const LocShape = { WallStraight: 0, WallDiagonal: 9, Centrepiece: 10, GroundDecoration: 22 };
 
 // Scenery light: ambient 64 and contrast 768 plus the object's own, from (-50, -10, -50).
 const OBJECT_LIGHT = { x: -50, y: -10, z: -50 };
