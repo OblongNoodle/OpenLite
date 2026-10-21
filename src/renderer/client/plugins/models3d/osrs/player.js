@@ -12,6 +12,7 @@ import {
   decodeItem,
   decodeKit,
   decodeModel,
+  decodeNpc,
   decodeSequence,
   frameFramemapId
 } from "./definitions.js";
@@ -129,11 +130,24 @@ export class OsrsCache {
   async load() {
     const opened = await window.osrsCache?.open();
     if (!opened?.ok) throw new Error(`OSRS cache unavailable: ${opened?.error ?? "no cache bridge"}`);
-    const [kitFiles, itemFiles, sequenceFiles] = await Promise.all([
+    const [kitFiles, itemFiles, sequenceFiles, npcFiles] = await Promise.all([
       window.osrsCache.files(CacheIndex.Configs, ConfigArchive.IdentityKit),
       window.osrsCache.files(CacheIndex.Configs, ConfigArchive.Item),
-      window.osrsCache.files(CacheIndex.Configs, ConfigArchive.Sequence)
+      window.osrsCache.files(CacheIndex.Configs, ConfigArchive.Sequence),
+      window.osrsCache.files(CacheIndex.Configs, ConfigArchive.Npc)
     ]);
+    this.npcsByName = new Map();
+    for (const file of npcFiles) {
+      try {
+        const npc = decodeNpc(file.id, file.data);
+        const key = npc.name.toLowerCase();
+        // Keep the first animated version of each name (later ids are often
+        // quest variants and transforms).
+        if (npc.name && npc.models.length && npc.standAnimation >= 0 && !this.npcsByName.has(key)) this.npcsByName.set(key, npc);
+      } catch {
+        // NPCs using fields not decoded here are simply unavailable.
+      }
+    }
     this.kits = kitFiles.map((file) => decodeKit(file.id, file.data));
     this.itemsByName = new Map();
     for (const file of itemFiles) {
@@ -350,6 +364,64 @@ export async function buildPlayerData(cache, appearanceIds, colors, gear) {
   return merged;
 }
 
+// HighSpell NPC names that differ from the closest OSRS NPC.
+const NPC_ALIASES = [
+  [/^isradore's /, ""],
+  [/^sewer rat$|^hell rat$/, "rat"],
+  [/^giant hell rat$/, "giant rat"],
+  [/^cave chicken$/, "chicken"],
+  [/^bull$/, "cow"],
+  [/^(brown|cave) bear$/, "grizzly bear"],
+  [/^(brown|black) bear cub$/, "bear cub"],
+  [/^plains dragon$/, "green dragon"],
+  [/^shadow dragon$/, "black dragon"],
+  [/^water dragon$/, "blue dragon"],
+  [/^fire dragon$/, "red dragon"],
+  [/^sky dragon$/, "bronze dragon"],
+  [/^dragon hatchling$/, "baby green dragon"],
+  [/^corrupt minotaur$/, "minotaur"],
+  [/^(king )?goblin jockey$/, "goblin"],
+  [/^damogui$/, "lesser demon"],
+  [/^nisse$/, "gnome"],
+  [/^shop owner$/, "shop keeper"],
+  [/^knight$/, "white knight"],
+  [/^wandering monk$/, "monk"]
+];
+
+// The OSRS NPC for a HighSpell NPC name: the same name, or a close stand-in.
+export function findNpc(cache, name) {
+  let key = String(name ?? "").toLowerCase();
+  if (cache.npcsByName.has(key)) return cache.npcsByName.get(key);
+  for (const [pattern, replacement] of NPC_ALIASES) {
+    key = key.replace(pattern, replacement);
+    if (cache.npcsByName.has(key)) return cache.npcsByName.get(key);
+  }
+  return null;
+}
+
+// The merged, recoloured, scaled and lit mesh data for an OSRS NPC, as the
+// client's NpcType.getBodyModel builds it.
+export async function buildNpcData(cache, npc) {
+  const models = (await Promise.all(npc.models.map((id) => cache.model(id)))).filter(Boolean);
+  if (!models.length) return null;
+  const merged = mergeModels(models);
+  npc.recolorToFind.forEach((color, i) => recolor(merged, color, npc.recolorToReplace[i]));
+  if (npc.widthScale !== 128 || npc.heightScale !== 128) {
+    merged.vertexX = merged.vertexX.map((x) => Math.trunc((x * npc.widthScale) / 128));
+    merged.vertexY = merged.vertexY.map((y) => Math.trunc((y * npc.heightScale) / 128));
+    merged.vertexZ = merged.vertexZ.map((z) => Math.trunc((z * npc.widthScale) / 128));
+  }
+  merged.cornerColors = lightModel(merged, { ...PLAYER_LIGHT, ambient: 64 + npc.ambient, contrast: 850 + npc.contrast });
+  merged.labels = new Map();
+  merged.groups.forEach((label, v) => {
+    if (label < 0) return;
+    if (!merged.labels.has(label)) merged.labels.set(label, []);
+    merged.labels.get(label).push(v);
+  });
+  merged.sequences = { idle: npc.standAnimation, walk: npc.walkAnimation >= 0 ? npc.walkAnimation : npc.standAnimation };
+  return merged;
+}
+
 // --- Animation -------------------------------------------------------------
 
 // Applies one frame to base vertex positions, as the client's Model.animate.
@@ -468,8 +540,11 @@ export class OsrsPlayerModel extends RigModel {
     this.mesh.isPickable = false;
     this.mesh.parent = this.root;
     this.parts.push(this.mesh);
-    // Model height in RS units (feet at y = 0, up is negative y).
+    // Model height and longest horizontal span in RS units (feet at y = 0, up
+    // is negative y).
     this.height = Math.max(1, -Math.min(...data.vertexY));
+    const span = (values) => Math.max(...values) - Math.min(...values);
+    this.length = Math.max(1, span(data.vertexX), span(data.vertexZ));
     this.writePositions(data.vertexX, data.vertexY, data.vertexZ);
   }
 
@@ -488,7 +563,11 @@ export class OsrsPlayerModel extends RigModel {
     this.mesh.updateVerticesData("position", p);
   }
 
+  // NPCs bring their own stand and walk animations; players use the player
+  // set, with an animation per activity.
   sequenceFor(pose) {
+    const npcSequences = this.data.sequences;
+    if (npcSequences) return pose.moving ? npcSequences.walk : npcSequences.idle;
     if (pose.moving) return SEQUENCES.walk;
     if (pose.activity === Activity.Chop && pose.woodcutting) return WOODCUTTING_SEQUENCE;
     return SEQUENCES[pose.activity] ?? SEQUENCES.idle;
@@ -502,10 +581,14 @@ export class OsrsPlayerModel extends RigModel {
     return this.animations.get(id);
   }
 
-  update(position, direction, pose, scale, deltaMs) {
-    // Sprite height (2 units at scale 1) sets the size; OSRS players are a
-    // little over 1.5 tiles tall.
-    const size = (2 * scale * 0.95) / (this.height / RS_UNITS_PER_TILE);
+  // box: { height, length } in tiles, the space the entity's sprite takes up.
+  // The model is scaled to fit inside it, so tall figures fit by height and
+  // long, low animals by length.
+  update(position, direction, pose, box, deltaMs) {
+    const size = Math.min(
+      box.height / (this.height / RS_UNITS_PER_TILE),
+      box.length / (this.length / RS_UNITS_PER_TILE)
+    );
     this.place(position, direction, { x: size, y: size, z: size }, deltaMs);
 
     const id = this.sequenceFor(pose);
@@ -513,7 +596,7 @@ export class OsrsPlayerModel extends RigModel {
       this.current = id;
       this.elapsed = 0;
     }
-    const frames = this.animation(id) ?? this.animation(SEQUENCES.idle);
+    const frames = this.animation(id) ?? this.animation(this.data.sequences?.idle ?? SEQUENCES.idle);
     if (!frames) return;
     this.elapsed += deltaMs;
     const total = frames.reduce((sum, f) => sum + f.ms, 0);

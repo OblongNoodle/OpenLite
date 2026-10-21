@@ -7,7 +7,46 @@ import { decodeOldFormat, decodeType1, decodeType2, decodeType3 } from "./modelF
 
 // Cache layout: index numbers, and archives inside the config index.
 export const CacheIndex = { Frames: 0, Framemaps: 1, Configs: 2, Models: 7 };
-export const ConfigArchive = { IdentityKit: 3, Item: 10, Sequence: 12 };
+export const ConfigArchive = { IdentityKit: 3, Npc: 9, Item: 10, Sequence: 12 };
+
+// NPC definitions: models, name, animations, recolours, scale and lighting.
+// Decoding stops at the first opcode past those (head icons, transforms...).
+export function decodeNpc(id, bytes) {
+  const s = new ByteStream(bytes);
+  const def = { id, name: "", models: [], size: 1, standAnimation: -1, walkAnimation: -1, recolorToFind: [], recolorToReplace: [], widthScale: 128, heightScale: 128, ambient: 0, contrast: 0, combatLevel: -1 };
+  for (let opcode = s.readUnsignedByte(); opcode !== 0; opcode = s.readUnsignedByte()) {
+    if (opcode === 1) def.models = Array.from({ length: s.readUnsignedByte() }, () => s.readUnsignedShort());
+    else if (opcode === 61) def.models = Array.from({ length: s.readUnsignedByte() }, () => s.readInt());
+    else if (opcode === 2) def.name = s.readString();
+    else if (opcode === 12) def.size = s.readUnsignedByte();
+    else if (opcode === 13) def.standAnimation = s.readUnsignedShort();
+    else if (opcode === 14) def.walkAnimation = s.readUnsignedShort();
+    else if (opcode === 15 || opcode === 16 || opcode === 18) s.readUnsignedShort();
+    else if (opcode === 17) {
+      def.walkAnimation = s.readUnsignedShort();
+      s.skip(6);
+    } else if (opcode >= 30 && opcode < 35) s.readString();
+    else if (opcode === 40) {
+      const count = s.readUnsignedByte();
+      for (let i = 0; i < count; i++) {
+        def.recolorToFind.push(s.readUnsignedShort());
+        def.recolorToReplace.push(s.readUnsignedShort());
+      }
+    } else if (opcode === 41) s.skip(s.readUnsignedByte() * 4);
+    else if (opcode === 42) s.readUnsignedShort();
+    else if (opcode === 60) s.skip(s.readUnsignedByte() * 2);
+    else if (opcode === 62) s.skip(s.readUnsignedByte() * 4);
+    else if (opcode >= 74 && opcode <= 79) s.readUnsignedShort();
+    else if (opcode === 93 || opcode === 99) continue;
+    else if (opcode === 95) def.combatLevel = s.readUnsignedShort();
+    else if (opcode === 97) def.widthScale = s.readUnsignedShort();
+    else if (opcode === 98) def.heightScale = s.readUnsignedShort();
+    else if (opcode === 100) def.ambient = s.readByte();
+    else if (opcode === 101) def.contrast = s.readByte();
+    else break;
+  }
+  return def;
+}
 
 // A model's vertices, triangles, per-face colours and render data. The trailing
 // bytes say which of the format revisions it uses.

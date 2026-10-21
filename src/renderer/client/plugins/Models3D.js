@@ -10,13 +10,15 @@ import { DEFAULT_COLORS, HumanModel, humanoidCreatureFor, loadHumanSpec, loadHum
 import { CreatureModel, creatureFamilyFor, loadCreatureSpec } from "./models3d/creatures.js";
 import { ITEM_SIZE, itemYaw, loadItemGeometry } from "./models3d/items.js";
 import { buildScenery, loadSceneryColors, sceneryKindFor } from "./models3d/scenery.js";
-import { OsrsCache, OsrsPlayerModel, buildPlayerData } from "./models3d/osrs/player.js";
+import { OsrsCache, OsrsPlayerModel, buildNpcData, buildPlayerData, findNpc } from "./models3d/osrs/player.js";
 import { ActionState } from "@highlite/core";
 
 // Model specs are cached per sprite so identical NPCs share one analysis.
 const MAX_CACHED_SPECS = 256;
 // Cells per creature in a creature spritesheet (3 frames x 5 directions).
 const CELLS_PER_CREATURE = 15;
+// Entity types in the client (players, as opposed to NPCs).
+const PLAYER_ENTITY_TYPE = 3;
 const SOUTH = 2;
 
 var Models3D = class extends Plugin {
@@ -287,6 +289,14 @@ var Models3D = class extends Plugin {
       // is relative to the camera and must not be used for a 3D model.
       if (record.model instanceof CreatureModel) {
         record.model.update(position, appearance.CurrentDirection, pose, appearance, deltaMs);
+      } else if (record.model instanceof OsrsPlayerModel) {
+        // OSRS models fit the space the sprite's figure takes up: creatures'
+        // proportions are measured from their sprites; people fill the height.
+        const spec = record.spec;
+        record.model.update(position, appearance.CurrentDirection, pose, {
+          height: appearance.Height * (spec?.heightFraction ?? 0.95),
+          length: appearance.Width * (spec?.lengthFraction ?? 1)
+        }, deltaMs);
       } else {
         record.model.update(position, appearance.CurrentDirection, pose, appearance.Height / 2, deltaMs);
       }
@@ -531,17 +541,23 @@ var Models3D = class extends Plugin {
         : new HumanModel(this.scene, this.ctors, material, spec ?? { colors: DEFAULT_COLORS, gear: {} }, name);
       if (record.model) record.model.yaw = previousYaw;
       record.spec = spec;
-      if (record.type.kind === "human" && spec && this.settings.osrsCharacters.value) this.upgradeToOsrsModel(record, key, name);
+      if (this.settings.osrsCharacters.value) this.upgradeToOsrsModel(record, key, name);
     });
   }
 
-  // Swaps a human's generated model for one built from the OSRS cache once
-  // its kit and equipment models have loaded.
+  // Swaps a generated model for one built from the OSRS cache once its models
+  // have loaded: NPCs as the OSRS NPC of the same (or a close) name, players
+  // from body kits and equipment.
   async upgradeToOsrsModel(record, key, name) {
     const cache = await this.osrsCache;
     if (!cache) return;
     try {
-      const data = await buildPlayerData(cache, record.spec.appearanceIds, record.spec.colors, record.spec.gear);
+      const isPlayer = record.entity.EntityType === PLAYER_ENTITY_TYPE;
+      const npc = isPlayer ? null : findNpc(cache, record.entity.Name);
+      let data = null;
+      if (npc) data = await buildNpcData(cache, npc);
+      else if (record.type.kind === "human" && record.spec) data = await buildPlayerData(cache, record.spec.appearanceIds, record.spec.colors, record.spec.gear);
+      if (!data) return;
       if (record.specKey !== key || this.records.get(record.entity) !== record) return;
       const previousYaw = record.model?.yaw ?? null;
       record.model?.dispose();
