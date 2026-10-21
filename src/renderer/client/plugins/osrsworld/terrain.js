@@ -94,6 +94,35 @@ async function readImage(url) {
   return { pixels: context.getImageData(0, 0, image.width, image.height).data, width: image.width, height: image.height };
 }
 
+// Ground geometry at a chosen resolution, laid out exactly as Babylon's
+// CreateGroundFromHeightMap does (so UVs, picking and height lookups behave
+// the same): a size x size square centred on the origin, `subdivisions` quads
+// per side, heights read from the heightmap's brightness.
+export async function buildTerrainGeometry(heightMapUrl, size, subdivisions, minHeight, maxHeight) {
+  const heights = await readImage(heightMapUrl);
+  const positions = [], uvs = [], indices = [];
+  for (let row = 0; row <= subdivisions; row++) {
+    for (let col = 0; col <= subdivisions; col++) {
+      const x = col * size / subdivisions - size / 2;
+      const z = (subdivisions - row) * size / subdivisions - size / 2;
+      const mapX = Math.floor((x + size / 2) / size * (heights.width - 1));
+      const mapY = Math.floor((1 - (z + size / 2) / size) * (heights.height - 1));
+      const i = (mapY * heights.width + mapX) * 4;
+      const brightness = (heights.pixels[i] * 0.3 + heights.pixels[i + 1] * 0.59 + heights.pixels[i + 2] * 0.11) / 255;
+      positions.push(x, minHeight + (maxHeight - minHeight) * brightness, z);
+      uvs.push(col / subdivisions, 1 - row / subdivisions);
+    }
+  }
+  const stride = subdivisions + 1;
+  for (let row = 0; row < subdivisions; row++) {
+    for (let col = 0; col < subdivisions; col++) {
+      indices.push(col + 1 + (row + 1) * stride, col + 1 + row * stride, col + row * stride);
+      indices.push(col + (row + 1) * stride, col + 1 + (row + 1) * stride, col + row * stride);
+    }
+  }
+  return { positions, uvs, indices };
+}
+
 // Paints the OSRS-style ground for one map region.
 //   textureUrl: the game's ground colours, one pixel per tile.
 //   heightMapUrl: the region's heightmap (grey = height).

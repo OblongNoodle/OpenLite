@@ -6,7 +6,7 @@
 // - terrain: one crisp colour per tile and faceted (flat-shaded) hills;
 // - objects: textures baked into one flat colour per face, like OSRS models.
 import { Plugin, SettingsTypes } from "@highlite/core";
-import { paintTerrain } from "./osrsworld/terrain.js";
+import { buildTerrainGeometry, paintTerrain } from "./osrsworld/terrain.js";
 import { osrsStyleTexture } from "./osrsworld/textures.js";
 
 // Map levels in the client.
@@ -60,6 +60,13 @@ var OsrsWorld = class extends Plugin {
         value: 72,
         min: 32,
         max: 120,
+        callback: () => {
+        }
+      },
+      fullResolutionTerrain: {
+        text: "Full-resolution terrain (one quad per tile)",
+        type: SettingsTypes.checkbox,
+        value: true,
         callback: () => {
         }
       },
@@ -249,15 +256,49 @@ var OsrsWorld = class extends Plugin {
 
   // The ground mesh is rebuilt whenever a new map region loads.
   updateGround(scene) {
+    const map = this.gameHooks.WorldMapManager?.Instance;
+    // Regions load with half as many quads as tiles; asking for one per tile
+    // makes every later region load at full resolution.
+    const options = map?._groundMeshOptions;
+    if (options && this.settings.fullResolutionTerrain.value && options.subdivisions !== map._numberTilesPerAxis) {
+      options.subdivisions = map._numberTilesPerAxis;
+    }
+
     const ground = scene.getMeshByName(GROUND_MESH_NAME);
     if (!ground || ground === this.groundMesh) return;
     this.restoreGroundTexture();
     this.groundMesh = ground;
-    if (this.settings.facetedTerrain.value) {
-      ground.convertToFlatShadedMesh();
-      this.refreezeWorldMatrix(ground);
-    }
-    this.refreshGround();
+    this.upgradeGroundGeometry(ground)
+      .catch((error) => this.error("Rebuilding terrain failed", error))
+      .finally(() => {
+        if (ground !== this.groundMesh) return;
+        if (this.settings.facetedTerrain.value) {
+          ground.convertToFlatShadedMesh();
+          this.refreezeWorldMatrix(ground);
+        }
+        this.refreshGround();
+      });
+  }
+
+  // A region loaded before the option took effect is rebuilt in place at one
+  // quad per tile. The ground's height lookups are told its new resolution.
+  async upgradeGroundGeometry(ground) {
+    const map = this.gameHooks.WorldMapManager?.Instance;
+    const tiles = map?._numberTilesPerAxis;
+    if (!this.settings.fullResolutionTerrain.value || !tiles || !map._heightMapUrl || ground._subdivisionsX >= tiles) return;
+    const options = map._groundMeshOptions;
+    const { positions, uvs, indices } = await buildTerrainGeometry(map._heightMapUrl, options.width, tiles, options.minHeight, options.maxHeight);
+    if (ground !== this.groundMesh || ground.isDisposed()) return;
+    ground.setVerticesData("position", positions, false);
+    ground.setVerticesData("uv", uvs, false);
+    ground.setIndices(indices);
+    ground.createNormals(false);
+    ground._subdivisionsX = ground._subdivisionsY = tiles;
+    // The height lookup table is only rebuilt for the new resolution when empty.
+    ground._heightQuads = [];
+    ground.updateCoordinateHeights();
+    ground.refreshBoundingInfo();
+    this.refreezeWorldMatrix(ground);
   }
 
   refreshGround() {

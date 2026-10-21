@@ -135,7 +135,7 @@ var Models3D = class extends Plugin {
     material.specularColor = new Color3(0, 0, 0);
     // Sprites render unlit at full brightness; partial self-illumination keeps the
     // model readable next to them in dark areas while still showing face shading.
-    material.emissiveColor = new Color3(0.45, 0.45, 0.45);
+    material.emissiveColor = new Color3(0.28, 0.28, 0.28);
     if (translucent) material.alpha = 0.55;
     this[key] = material;
     return material;

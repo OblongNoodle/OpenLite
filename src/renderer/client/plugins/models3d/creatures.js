@@ -66,10 +66,18 @@ export async function loadCreatureSpec(spritesheetInfo, startIndex, family, name
   };
 }
 
+// A leg hanging from its hip: tapering down to a slightly wider foot or hoof.
 function leg(width, height, depth, color, footColor = color) {
+  const foot = Math.min(0.06, height * 0.2);
   return new GeometryBuilder()
-    .box(width, height, depth, 0, -height / 2, 0, color)
-    .box(width * 1.1, Math.min(0.06, height * 0.2), depth * 1.3, 0, -height + 0.02, depth * 0.1, footColor);
+    .lathe([[0.02, width * 0.55, depth * 0.55], [-height * 0.5, width * 0.45, depth * 0.45], [-height + foot, width * 0.36, depth * 0.38]], 6, 0, 0, 0, color)
+    .lathe([[-height + foot + 0.01, width * 0.42, depth * 0.48], [-height, width * 0.5, depth * 0.62]], 6, 0, 0, depth * 0.08, footColor);
+}
+
+// An egg-shaped body along Z (nose toward +Z): the ends narrower than the middle.
+function body(length, width, height) {
+  const l = length / 2;
+  return [[-l, width * 0.28, height * 0.3], [-l * 0.65, width * 0.45, height * 0.46], [l * 0.1, width * 0.5, height * 0.5], [l * 0.65, width * 0.42, height * 0.44], [l, width * 0.24, height * 0.28]];
 }
 
 // Each builder adds parts to the rig and records which ones animate:
@@ -77,10 +85,9 @@ function leg(width, height, depth, color, footColor = color) {
 const BUILDERS = {
   rodent(rig, s) {
     const accent = s.second;
-    rig.body = rig.part("body", new GeometryBuilder().box(0.62, 0.42, 0.5, 0, 0.32, 0.02, s.body), 0, 0, 0);
+    rig.body = rig.part("body", new GeometryBuilder().lathe(body(0.56, 0.66, 0.46), 8, 0, 0.32, 0.02, s.body, { axis: "z" }), 0, 0, 0);
     rig.head = rig.part("head", new GeometryBuilder()
-      .box(0.5, 0.36, 0.22, 0, 0, 0.1, s.body)
-      .box(0.24, 0.18, 0.1, 0, -0.06, 0.25, s.body)
+      .lathe([[-0.02, 0.24, 0.17], [0.12, 0.22, 0.15], [0.24, 0.12, 0.09], [0.3, 0.05, 0.05]], 8, 0, -0.02, 0, s.body, { axis: "z" })
       .box(0.1, 0.08, 0.04, 0, -0.06, 0.31, accent)
       .box(0.16, 0.16, 0.04, -0.2, 0.2, 0.04, accent)
       .box(0.16, 0.16, 0.04, 0.2, 0.2, 0.04, accent)
@@ -136,7 +143,7 @@ const BUILDERS = {
 
   cattle(rig, s) {
     const isCow = s.name.includes("cow");
-    rig.body = rig.part("body", new GeometryBuilder().box(0.86, 0.46, 0.66, 0, 0.62, -0.04, s.body), 0, 0, 0);
+    rig.body = rig.part("body", new GeometryBuilder().lathe(body(0.76, 0.9, 0.52), 8, 0, 0.62, -0.04, s.body, { axis: "z" }), 0, 0, 0);
     if (isCow && s.second) {
       // Patches of the second colour on both flanks and the back.
       const patch = new GeometryBuilder()
@@ -150,8 +157,8 @@ const BUILDERS = {
     }
     const horn = isCow ? 0.1 : 0.2;
     rig.head = rig.part("head", new GeometryBuilder()
-      .box(0.42, 0.36, 0.28, 0, 0, 0.1, s.body)
-      .box(0.36, 0.2, 0.12, 0, -0.1, 0.27, isCow ? PINK : shade(s.body, 0.75))
+      .lathe([[-0.04, 0.2, 0.17], [0.1, 0.22, 0.18], [0.22, 0.19, 0.14]], 8, 0, 0.02, 0, s.body, { axis: "z" })
+      .lathe([[0.2, 0.19, 0.11], [0.3, 0.2, 0.12], [0.35, 0.16, 0.1]], 8, 0, -0.08, 0, isCow ? PINK : shade(s.body, 0.75), { axis: "z" })
       .box(0.06, 0.05, 0.02, -0.12, 0.06, 0.245, DARK)
       .box(0.06, 0.05, 0.02, 0.12, 0.06, 0.245, DARK)
       .box(0.14, 0.06, 0.06, -0.28, 0.08, 0.02, s.body)
@@ -172,12 +179,11 @@ const BUILDERS = {
     const coat = shade(s.body, 1.2);
     const muzzle = s.third ?? shade(s.body, 1.9);
     rig.body = rig.part("body", new GeometryBuilder()
-      .box(0.7, 0.4, 0.68, 0, 0.6, -0.06, coat)
-      .box(0.62, 0.18, 0.3, 0, 0.84, 0.12, coat)
-      .box(0.6, 0.06, 0.56, 0, 0.38, -0.06, shade(coat, 0.8)), 0, 0, 0);
+      .lathe(body(0.8, 0.74, 0.56), 8, 0, 0.6, -0.06, coat, { axis: "z" })
+      .lathe([[-0.12, 0.26, 0.1], [0.06, 0.3, 0.13], [0.22, 0.24, 0.09]], 8, 0, 0.8, 0.08, coat, { axis: "z" }), 0, 0, 0);
     rig.head = rig.part("head", new GeometryBuilder()
-      .box(0.42, 0.34, 0.28, 0, 0, 0.06, coat)
-      .box(0.22, 0.16, 0.18, 0, -0.07, 0.27, muzzle)
+      .lathe([[-0.06, 0.18, 0.15], [0.06, 0.21, 0.17], [0.18, 0.16, 0.13]], 8, 0, 0, 0.02, coat, { axis: "z" })
+      .lathe([[0.16, 0.1, 0.08], [0.3, 0.1, 0.075], [0.36, 0.07, 0.055]], 8, 0, -0.07, 0, muzzle, { axis: "z" })
       .box(0.09, 0.06, 0.03, 0, -0.03, 0.37, DARK)
       .box(0.05, 0.05, 0.02, -0.11, 0.07, 0.205, DARK)
       .box(0.05, 0.05, 0.02, 0.11, 0.07, 0.205, DARK)
@@ -193,23 +199,21 @@ const BUILDERS = {
     const membrane = s.second;
     const belly = shade(s.body, 1.2);
     rig.body = rig.part("body", new GeometryBuilder()
-      .box(0.36, 0.3, 0.34, 0, 0.46, 0.02, s.body)
-      .box(0.3, 0.06, 0.3, 0, 0.32, 0.02, belly)
+      .lathe(body(0.42, 0.38, 0.32), 8, 0, 0.46, 0.02, s.body, { axis: "z" })
+      .lathe([[-0.12, 0.13, 0.04], [0.12, 0.13, 0.04]], 6, 0, 0.33, 0.02, belly, { axis: "z" })
       .box(0.04, 0.06, 0.3, 0, 0.63, 0.02, BONE), 0, 0, 0);
     const neck = rig.joint("neck", 0, 0.55, 0.17, rig.body);
-    rig.part("neck-mesh", new GeometryBuilder().box(0.14, 0.28, 0.14, 0, 0.12, 0.05, s.body, 0.6), 0, 0, 0, neck);
+    rig.part("neck-mesh", new GeometryBuilder().lathe([[-0.02, 0.075, 0.075], [0.28, 0.055, 0.055]], 6, 0, 0, 0.05, s.body, { tiltX: 0.6 }), 0, 0, 0, neck);
     rig.head = rig.part("head", new GeometryBuilder()
-      .box(0.18, 0.14, 0.24, 0, 0, 0.08, s.body)
-      .box(0.14, 0.05, 0.16, 0, -0.08, 0.12, belly)
+      .lathe([[-0.04, 0.09, 0.08], [0.08, 0.1, 0.08], [0.2, 0.07, 0.05], [0.24, 0.04, 0.03]], 8, 0, 0, 0, s.body, { axis: "z" })
+      .lathe([[0, 0.07, 0.025], [0.2, 0.05, 0.02]], 6, 0, -0.07, 0, belly, { axis: "z" })
       .box(0.04, 0.03, 0.02, -0.06, 0.04, 0.21, [0.95, 0.2, 0.1])
       .box(0.04, 0.03, 0.02, 0.06, 0.04, 0.21, [0.95, 0.2, 0.1])
       .box(0.04, 0.16, 0.04, -0.06, 0.12, -0.06, BONE, -0.7)
       .box(0.04, 0.16, 0.04, 0.06, 0.12, -0.06, BONE, -0.7), 0, 0.28, 0.2, neck);
     rig.tail = rig.part("tail", new GeometryBuilder()
-      .box(0.2, 0.16, 0.2, 0, 0, -0.1, s.body)
-      .box(0.14, 0.12, 0.2, 0, -0.04, -0.28, s.body)
-      .box(0.08, 0.08, 0.16, 0, -0.08, -0.44, s.body)
-      .box(0.12, 0.1, 0.03, 0, -0.08, -0.52, BONE), 0, 0.46, -0.15);
+      .lathe([[0, 0.1, 0.08], [-0.2, 0.07, 0.06], [-0.38, 0.04, 0.035], [-0.5, 0.015, 0.015]], 6, 0, -0.04, 0, s.body, { axis: "z", tiltX: -0.12 })
+      .box(0.12, 0.1, 0.03, 0, -0.1, -0.52, BONE), 0, 0.46, -0.15);
     rig.wings = [-1, 1].map((side) => rig.part(`wing-${side}`, new GeometryBuilder()
       .box(0.42, 0.02, 0.3, side * 0.21, 0, -0.04, membrane)
       .box(0.44, 0.04, 0.04, side * 0.22, 0.01, 0.12, s.body), side * 0.16, 0.6, 0.08));
@@ -223,10 +227,10 @@ const BUILDERS = {
 function buildBird(rig, s, height) {
   const h = (y) => y * height;
   rig.body = rig.part("body", new GeometryBuilder()
-    .box(0.62, h(0.42), 0.62, 0, h(0.48), -0.02, s.body)
+    .lathe([[-0.34, 0.14, h(0.14)], [-0.2, 0.28, h(0.2)], [0.04, 0.31, h(0.22)], [0.22, 0.24, h(0.18)], [0.3, 0.12, h(0.1)]], 8, 0, h(0.48), -0.02, s.body, { axis: "z" })
     .box(0.4, h(0.38), 0.14, 0, h(0.72), -0.36, s.body, -0.4), 0, 0, 0);
   rig.head = rig.part("head", new GeometryBuilder()
-    .box(0.26, h(0.26), 0.24, 0, 0, 0.06, s.body)
+    .lathe([[-h(0.12), 0.1, 0.1], [-h(0.02), 0.135, 0.125], [h(0.08), 0.125, 0.115], [h(0.14), 0.06, 0.06]], 8, 0, 0, 0.06, s.body)
     .box(0.1, h(0.07), 0.12, 0, -h(0.02), 0.22, BEAK)
     .box(0.06, h(0.14), 0.2, 0, h(0.17), 0.06, COMB)
     .box(0.06, h(0.1), 0.05, 0, -h(0.12), 0.18, COMB)
