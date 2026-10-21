@@ -8,6 +8,7 @@ import { AppearanceArt } from "./models3d/sampling.js";
 import { ACTIVITY_BY_STATE, Activity, LOOP_INTERVAL_MS, STRIKE_DURATION_MS } from "./models3d/pose.js";
 import { DEFAULT_COLORS, HumanModel, humanoidCreatureFor, loadHumanSpec, loadHumanoidCreatureSpec } from "./models3d/human.js";
 import { CreatureModel, creatureFamilyFor, loadCreatureSpec } from "./models3d/creatures.js";
+import { ITEM_SIZE, itemYaw, loadItemGeometry } from "./models3d/items.js";
 
 // Model specs are cached per sprite so identical NPCs share one analysis.
 const MAX_CACHED_SPECS = 256;
@@ -35,11 +36,20 @@ var Models3D = class extends Plugin {
       callback: () => {
       }
     };
+    this.settings.groundItems = {
+      text: "3D ground items",
+      type: SettingsTypes.checkbox,
+      value: true,
+      callback: () => {
+      }
+    };
     this.observer = null;
     this.material = null;
     this.ctors = null;
     this.records = new Map();
     this.specCache = new Map();
+    this.itemRecords = new Map();
+    this.itemSources = new Map();
   }
 
   init() {
@@ -52,7 +62,10 @@ var Models3D = class extends Plugin {
     // Hot-swapped instances keep their old fields; make sure ours exist.
     this.records ??= new Map();
     this.specCache ??= new Map();
+    this.itemRecords ??= new Map();
+    this.itemSources ??= new Map();
     this.settings.creatures ??= { text: "3D creatures", type: SettingsTypes.checkbox, value: true, callback: () => {} };
+    this.settings.groundItems ??= { text: "3D ground items", type: SettingsTypes.checkbox, value: true, callback: () => {} };
     this.attachRenderObserver();
   }
 
@@ -62,6 +75,7 @@ var Models3D = class extends Plugin {
     this.hideGallery();
     for (const record of this.records.values()) this.disposeRecord(record);
     this.records.clear();
+    this.clearGroundItems();
     // Specs are cheap to rebuild and may come from older code after a hot swap.
     this.specCache.clear();
     for (const key of ["material", "translucentMaterial"]) {
@@ -252,6 +266,8 @@ var Models3D = class extends Plugin {
       }
     }
 
+    this.renderGroundItems();
+
     for (const exhibit of this.gallery ?? []) {
       const pose = { ...this.galleryPose, strike: null };
       if (exhibit.model instanceof CreatureModel) {
@@ -260,6 +276,77 @@ var Models3D = class extends Plugin {
         exhibit.model.update(exhibit.position, SOUTH, pose, exhibit.size.Height / 2, deltaMs);
       }
     }
+  }
+
+  // Each ground item gets an instance of its item's extruded icon; the
+  // billboard stays in the scene, invisible, as the click target.
+  renderGroundItems() {
+    const groundItems = this.gameHooks.GroundItemManager?.Instance?.GroundItems;
+    const enabled = this.settings.groundItems.value && this.ctors && groundItems;
+    const seen = new Set();
+    if (enabled) {
+      for (const item of groundItems.values()) {
+        const appearance = item?.Appearance;
+        const info = appearance?.SpritesheetInformation;
+        if (!appearance?.BillboardMesh || !info?.SpritesheetURL || item.IsDestroyed) continue;
+        seen.add(item);
+        let record = this.itemRecords.get(item);
+        if (!record) {
+          record = { item, appearance, instance: null };
+          this.itemRecords.set(item, record);
+          this.getItemSource(info, appearance._currentSpriteIndex).then((source) => {
+            if (!source || this.itemRecords.get(item) !== record) return;
+            record.instance = source.createInstance(`models3d-item-${item.EntityID}`);
+            record.instance.isPickable = false;
+            record.instance.rotation.y = itemYaw(item.EntityID);
+            record.instance.scaling.set(ITEM_SIZE, ITEM_SIZE, ITEM_SIZE);
+          });
+        }
+        if (!record.instance) continue;
+        const position = appearance.Position;
+        record.instance.position.set(position.x, position.y - appearance.Height / 2 + 0.01, position.z);
+        record.instance.setEnabled(appearance.IsVisible !== false);
+        if (appearance.BillboardMesh.visibility !== 0) appearance.BillboardMesh.visibility = 0;
+      }
+    }
+    for (const [item, record] of this.itemRecords) {
+      if (seen.has(item)) continue;
+      this.disposeItemRecord(record);
+      this.itemRecords.delete(item);
+    }
+  }
+
+  // One hidden source mesh per item icon; ground items are instances of it.
+  getItemSource(info, cellIndex) {
+    const key = `${info.SpritesheetURL}#${cellIndex}`;
+    let source = this.itemSources.get(key);
+    if (!source) {
+      source = loadItemGeometry(info, cellIndex).then((geometry) => {
+        const mesh = geometry.applyTo(new this.ctors.Mesh(`models3d-itemsource-${cellIndex}`, this.scene));
+        mesh.material = this.getMaterial();
+        mesh.isPickable = false;
+        mesh.setEnabled(false);
+        return mesh;
+      }).catch((error) => {
+        this.error("Failed to build ground item", error);
+        return null;
+      });
+      this.itemSources.set(key, source);
+    }
+    return source;
+  }
+
+  disposeItemRecord(record) {
+    record.instance?.dispose();
+    record.instance = null;
+    if (record.appearance?.BillboardMesh && !record.item.IsDestroyed) record.appearance.BillboardMesh.visibility = 1;
+  }
+
+  clearGroundItems() {
+    for (const record of this.itemRecords?.values() ?? []) this.disposeItemRecord(record);
+    this.itemRecords?.clear();
+    for (const source of this.itemSources?.values() ?? []) source.then((mesh) => mesh?.dispose());
+    this.itemSources?.clear();
   }
 
   // Dev aid, called from the console: one model of every creature type in a

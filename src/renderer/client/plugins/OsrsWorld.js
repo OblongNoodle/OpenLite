@@ -6,15 +6,17 @@
 // - terrain: one crisp colour per tile and faceted (flat-shaded) hills;
 // - objects: textures baked into one flat colour per face, like OSRS models.
 import { Plugin, SettingsTypes } from "@highlite/core";
+import { paintTerrain } from "./osrsworld/terrain.js";
+import { osrsStyleTexture } from "./osrsworld/textures.js";
 
 // Map levels in the client.
 const MapLevel = { EarthUnderground: 0, EarthOverworld: 1, EarthSky: 2, MoonUnderground: 3, MoonOverworld: 4 };
 const GROUND_MESH_NAME = "ground";
 const NEAREST_SAMPLING = 1;
 const BILINEAR_SAMPLING = 2;
-// Textures with more see-through texels than this are cutouts (reeds, grass
-// cards, fences); baking them would turn their transparent parts solid.
-const MAX_BAKE_TRANSPARENCY = 0.2;
+// When more of a mesh's triangles than this land on see-through texels, its
+// texture is a cutout (reeds, grass cards) and baking would turn the gaps solid.
+const MAX_BAKE_TRANSPARENCY = 0.25;
 // How often to look for newly loaded objects (new map regions) to bake.
 const BAKE_SCAN_INTERVAL_MS = 1000;
 
@@ -61,23 +63,43 @@ var OsrsWorld = class extends Plugin {
         callback: () => {
         }
       },
-      tiledGround: {
-        text: "One colour per ground tile",
+      osrsTerrain: {
+        text: "OSRS terrain shading",
         type: SettingsTypes.checkbox,
         value: true,
+        callback: () => this.refreshGround()
+      },
+      tileVisibility: {
+        text: "Tile visibility (OSRS shading)",
+        type: SettingsTypes.range,
+        value: 5,
+        min: 0,
+        max: 10,
+        callback: () => this.refreshGround()
+      },
+      tiledGround: {
+        text: "One flat colour per tile (when OSRS shading is off)",
+        type: SettingsTypes.checkbox,
+        value: false,
         callback: () => this.applyGroundSampling()
       },
       facetedTerrain: {
         text: "Faceted terrain",
         type: SettingsTypes.checkbox,
-        value: true,
+        value: false,
         callback: () => {
         }
       },
-      flatObjects: {
-        text: "Flat-coloured objects",
+      osrsTextures: {
+        text: "OSRS-style object textures",
         type: SettingsTypes.checkbox,
         value: true,
+        callback: () => this.settings.osrsTextures.value || this.restoreTextures()
+      },
+      flatObjects: {
+        text: "Flat-coloured objects (when OSRS textures are off)",
+        type: SettingsTypes.checkbox,
+        value: false,
         callback: () => this.settings.flatObjects.value || this.unbakeAll()
       }
     };
@@ -92,6 +114,9 @@ var OsrsWorld = class extends Plugin {
     this.bakedMeshes = new WeakSet();
     this.lastBakeScan = 0;
     this.bakeInProgress = false;
+    // Retextured materials: material -> original texture.
+    this.retextured = new Map();
+    this.facetedMeshes = new WeakSet();
   }
 
   init() {
@@ -102,7 +127,7 @@ var OsrsWorld = class extends Plugin {
     this.log("Started");
     // Hot-swapped instances keep their old fields; make sure ours exist.
     this.defineSettings();
-    if (!this.bakedMaterials) this.resetTracking();
+    this.resetTracking();
     this.attachRenderObserver();
   }
 
@@ -111,6 +136,8 @@ var OsrsWorld = class extends Plugin {
     this.detachRenderObserver();
     this.restore();
     this.unbakeAll();
+    this.restoreTextures();
+    this.restoreGroundTexture();
     if (this.groundMesh) this.setGroundSampling(this.groundMesh, BILINEAR_SAMPLING);
     this.groundMesh = null;
   }
@@ -147,14 +174,67 @@ var OsrsWorld = class extends Plugin {
 
   renderFrame(scene) {
     this.updateGround(scene);
-    if (this.settings.flatObjects.value && !this.bakeInProgress && performance.now() - this.lastBakeScan > BAKE_SCAN_INTERVAL_MS) {
+    const objectMode = this.settings.osrsTextures.value ? "retexture" : this.settings.flatObjects.value ? "bake" : null;
+    if (objectMode && !this.bakeInProgress && performance.now() - this.lastBakeScan > BAKE_SCAN_INTERVAL_MS) {
       this.lastBakeScan = performance.now();
       this.bakeInProgress = true;
-      this.bakeNewObjects(scene)
-        .catch((error) => this.error("Baking objects failed", error))
+      (objectMode === "retexture" ? this.retextureNewObjects(scene) : this.bakeNewObjects(scene))
+        .catch((error) => this.error("Updating objects failed", error))
         .finally(() => (this.bakeInProgress = false));
     }
     this.updateAtmosphere(scene);
+  }
+
+  // Object materials (walls, roofs, trees, rocks...) with a diffuse texture.
+  // Merged meshes use a MultiMaterial; its sub-materials are included.
+  *objectMaterials(mesh) {
+    const material = mesh.material;
+    if (!material || mesh.billboardMode || mesh.name === GROUND_MESH_NAME || mesh.name.startsWith("models3d")) return;
+    const materials = material.getClassName() === "MultiMaterial" ? material.subMaterials : [material];
+    for (const sub of materials) if (sub?.getClassName?.() === "StandardMaterial") yield sub;
+  }
+
+  // Gives every newly loaded object OSRS-style textures and faceted shading.
+  async retextureNewObjects(scene) {
+    for (const mesh of [...scene.meshes]) {
+      const source = mesh.sourceMesh ?? mesh;
+      let touched = false;
+      for (const material of this.objectMaterials(source)) {
+        touched = true;
+        if (this.retextured.has(material) || !material.diffuseTexture?.isReady?.()) continue;
+        await this.retexture(material);
+      }
+      if (touched && !this.facetedMeshes.has(source) && !source.isDisposed() && source.getTotalVertices?.() > 0) {
+        this.facetedMeshes.add(source);
+        source.convertToFlatShadedMesh();
+        this.refreezeWorldMatrix(source);
+      }
+    }
+  }
+
+  async retexture(material) {
+    const original = material.diffuseTexture;
+    this.retextured.set(material, original);
+    const { width, height } = original.getSize();
+    const pixels = await original.readPixels();
+    if (!pixels || material.diffuseTexture !== original) return;
+    const canvas = osrsStyleTexture(pixels, width, height);
+    const Texture = original.constructor;
+    const texture = new Texture(canvas.toDataURL(), material.getScene(), false, original._invertY ?? true, NEAREST_SAMPLING);
+    texture.hasAlpha = original.hasAlpha;
+    texture.wrapU = original.wrapU;
+    texture.wrapV = original.wrapV;
+    material.unfreeze?.();
+    material.diffuseTexture = texture;
+  }
+
+  restoreTextures() {
+    for (const [material, original] of this.retextured) {
+      const current = material.diffuseTexture;
+      material.diffuseTexture = original;
+      if (current && current !== original) current.dispose();
+    }
+    this.retextured.clear();
   }
 
   // Static meshes have frozen world matrices; after their geometry changes the
@@ -171,16 +251,56 @@ var OsrsWorld = class extends Plugin {
   updateGround(scene) {
     const ground = scene.getMeshByName(GROUND_MESH_NAME);
     if (!ground || ground === this.groundMesh) return;
+    this.restoreGroundTexture();
     this.groundMesh = ground;
     if (this.settings.facetedTerrain.value) {
       ground.convertToFlatShadedMesh();
       this.refreezeWorldMatrix(ground);
     }
-    this.applyGroundSampling();
+    this.refreshGround();
+  }
+
+  refreshGround() {
+    if (!this.groundMesh) return;
+    if (this.settings.osrsTerrain.value) {
+      this.paintGround(this.groundMesh).catch((error) => this.error("Painting terrain failed", error));
+    } else {
+      this.restoreGroundTexture();
+      this.applyGroundSampling();
+    }
+  }
+
+  // Replaces the ground texture with an OSRS-style painted one (see
+  // osrsworld/terrain.js), keeping the original to put back later.
+  async paintGround(ground) {
+    const map = this.gameHooks.WorldMapManager?.Instance;
+    const original = this.originalGroundTexture ?? ground.material?._textures?.groundTexture;
+    if (!map?._textureUrl || !map._heightMapUrl || !original) return;
+    const options = map._groundMeshOptions;
+    const canvas = await paintTerrain(map._textureUrl, map._heightMapUrl, options.maxHeight - options.minHeight, this.settings.tileVisibility.value / 10);
+    if (ground !== this.groundMesh || ground.isDisposed() || !this.settings.osrsTerrain.value) return;
+    const Texture = original.constructor;
+    // Nearest filtering up close keeps the grain crisp, like OSRS textures.
+    const painted = new Texture(canvas.toDataURL(), ground.getScene(), false, original._invertY ?? true, NEAREST_SAMPLING);
+    painted.wrapU = painted.wrapV = original.wrapU;
+    this.restoreGroundTexture();
+    this.originalGroundTexture = original;
+    this.paintedGroundTexture = painted;
+    ground.material.setTexture("groundTexture", painted);
+  }
+
+  restoreGroundTexture() {
+    if (this.originalGroundTexture && this.groundMesh && !this.groundMesh.isDisposed()) {
+      this.groundMesh.material?.setTexture("groundTexture", this.originalGroundTexture);
+    }
+    this.paintedGroundTexture?.dispose();
+    this.paintedGroundTexture = null;
+    this.originalGroundTexture = null;
   }
 
   applyGroundSampling() {
-    if (this.groundMesh) this.setGroundSampling(this.groundMesh, this.settings.tiledGround.value ? NEAREST_SAMPLING : BILINEAR_SAMPLING);
+    if (!this.groundMesh || this.paintedGroundTexture) return;
+    this.setGroundSampling(this.groundMesh, this.settings.tiledGround.value ? NEAREST_SAMPLING : BILINEAR_SAMPLING);
   }
 
   setGroundSampling(ground, mode) {
@@ -188,17 +308,32 @@ var OsrsWorld = class extends Plugin {
     if (texture && texture.samplingMode !== mode) texture.updateSamplingMode(mode);
   }
 
-  // Bakes every textured object not seen before. Textures are read once per
-  // material and kept, so objects loaded later that share an already-baked
-  // material are baked from the stored pixels.
+  // Bakes every textured object not seen before. Each material's texture is
+  // read once and kept. Whether a material is baked is decided from the first
+  // mesh that uses it; meshes loaded later that share an already-baked material
+  // are baked from the stored pixels.
   async bakeNewObjects(scene) {
     for (const mesh of [...scene.meshes]) {
       const source = mesh.sourceMesh ?? mesh;
       if (this.bakedMeshes.has(source) || !this.isBakeable(source)) continue;
-      const baked = await this.getBakedMaterial(source.material);
-      if (!baked || source.isDisposed()) continue;
-      this.bakeMesh(source, baked);
+      const material = source.material;
+      const baked = await this.getMaterialPixels(material);
+      if (!baked || source.isDisposed() || this.skippedMaterials.has(material)) continue;
+      const { colors, transparentFraction } = this.faceColors(source, baked);
       this.bakedMeshes.add(source);
+      if (!baked.decided) {
+        if (transparentFraction > MAX_BAKE_TRANSPARENCY) {
+          this.skippedMaterials.add(material);
+          this.bakedMaterials.delete(material);
+          continue;
+        }
+        baked.decided = true;
+        material.unfreeze?.();
+        material.diffuseTexture = null;
+        material.diffuseColor.set(1, 1, 1);
+      }
+      source.setVerticesData("color", colors, false);
+      this.refreezeWorldMatrix(source);
     }
   }
 
@@ -210,35 +345,27 @@ var OsrsWorld = class extends Plugin {
       !!mesh.getVerticesData?.("uv");
   }
 
-  async getBakedMaterial(material) {
+  async getMaterialPixels(material) {
     const known = this.bakedMaterials.get(material);
     if (known) return known;
     const texture = material.diffuseTexture;
     if (!texture?.isReady?.()) return null;
     const { width, height } = texture.getSize();
     const pixels = await texture.readPixels();
-    if (!pixels || this.bakedMaterials.has(material)) return this.bakedMaterials.get(material) ?? null;
-    let transparent = 0;
-    for (let i = 3; i < pixels.length; i += 4) if (pixels[i] < 128) transparent++;
-    if (transparent / (width * height) > MAX_BAKE_TRANSPARENCY) {
-      this.skippedMaterials.add(material);
-      return null;
-    }
-    const baked = { texture, pixels, width, height };
-    this.bakedMaterials.set(material, baked);
-    material.unfreeze?.();
-    material.diffuseTexture = null;
-    material.diffuseColor.set(1, 1, 1);
-    return baked;
+    if (!pixels) return null;
+    if (!this.bakedMaterials.has(material)) this.bakedMaterials.set(material, { texture, pixels, width, height, decided: false });
+    return this.bakedMaterials.get(material);
   }
 
-  // Flat-shades a mesh and gives each triangle the texture colour at its centre.
-  bakeMesh(mesh, { pixels, width, height }) {
+  // Flat-shades a mesh and works out each triangle's colour: the texture at its
+  // centre. Also reports how many triangles landed on see-through texels.
+  faceColors(mesh, { pixels, width, height }) {
     mesh.convertToFlatShadedMesh();
     const uv = mesh.getVerticesData("uv");
     const count = uv.length / 2;
     const colors = new Float32Array(count * 4);
     const wrap = (value) => ((value % 1) + 1) % 1;
+    let transparent = 0;
     for (let t = 0; t + 2 < count; t += 3) {
       const u = (uv[t * 2] + uv[t * 2 + 2] + uv[t * 2 + 4]) / 3;
       const v = (uv[t * 2 + 1] + uv[t * 2 + 3] + uv[t * 2 + 5]) / 3;
@@ -246,6 +373,7 @@ var OsrsWorld = class extends Plugin {
       const x = Math.min(width - 1, Math.floor(wrap(u) * width));
       const y = Math.min(height - 1, Math.floor((1 - wrap(v)) * height));
       const i = (y * width + x) * 4;
+      if (pixels[i + 3] < 128) transparent++;
       for (let k = 0; k < 3; k++) {
         colors[(t + k) * 4] = pixels[i] / 255;
         colors[(t + k) * 4 + 1] = pixels[i + 1] / 255;
@@ -253,8 +381,7 @@ var OsrsWorld = class extends Plugin {
         colors[(t + k) * 4 + 3] = 1;
       }
     }
-    mesh.setVerticesData("color", colors, false);
-    this.refreezeWorldMatrix(mesh);
+    return { colors, transparentFraction: count ? transparent / (count / 3) : 0 };
   }
 
   // Puts the textures back. Geometry stays flat-shaded, which only changes how
