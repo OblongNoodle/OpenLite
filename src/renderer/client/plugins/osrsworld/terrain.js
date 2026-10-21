@@ -1,28 +1,33 @@
-// OSRS-style terrain, following how the RS client builds its ground
-// (SceneGraph.buildScene in the 2009 client):
+// OSRS-style ground, built the way the RS client builds its scene
+// (SceneGraph.buildScene in the 2009 client): geometry with a colour at every
+// tile corner, no texture.
 //
 // - Underlay colours are blended: each tile takes the average colour of the
-//   11x11 tiles around it, in HSL, with hue weighted by chroma. Each tile has
-//   one blended colour.
+//   11x11 tiles around it, in HSL, with hue weighted by chroma. A tile's
+//   corners take the blended colours around them, and the GPU shades
+//   between corners, so underlays change smoothly from tile to tile.
 // - Every tile corner gets a lightness from the slope of the land there, lit
 //   from the same direction as models: 74 + (normal . light) / 214, which is
-//   86 on flat ground.
-// - Each tile is drawn as two triangles (split from its south-west to its
-//   north-east corner) shading its colour between its corners' lightness.
-// - Overlays (paths, floors) are not blended and keep crisp edges.
+//   86 on flat ground. Where a map gives no heights, the client makes them up
+//   with its height noise (PerlinNoise.getTileHeight): the land rolls a little
+//   everywhere, so the light changes from corner to corner, and that is what
+//   gives OSRS ground its mottled look. The game's land is nearly flat, so the
+//   same noise is added for lighting only (the ground stays where it is).
+// - Overlays (paths, floors) are one flat colour per tile, lit per corner,
+//   and are tile shapes: full squares, plus the half of a grass tile cut
+//   corner to corner where a path steps, so their edges are straight lines.
 //
-// The game gives us one painted colour per tile with roads already in it, so
-// tiles that stand out from their blended surroundings are treated as
-// overlays and keep their own colour. The result is painted into a
-// higher-resolution ground texture for the game's own terrain shader.
+// The game gives us one painted colour per tile with roads already in it.
+// Grass is underlay, as in OSRS maps; earth and stone (paths, dirt patches,
+// floors) are overlays. OSRS maps mix several
+// underlays (grass of a few shades); the game has one, so a gentle
+// low-frequency variation is added in their place. The game's colours are
+// also moved toward OSRS's palette (olive grass, brown earth).
 
-// Pixels per tile in the painted texture.
-export const PIXELS_PER_TILE = 12;
 // Underlay blending reaches this many tiles each way (the client uses 5).
 const BLEND_RADIUS = 5;
-// A tile further than this (RGB, 0-1 per channel) from its blended colour is
-// treated as an overlay and keeps its own colour.
-const OVERLAY_DISTANCE = 0.13;
+// Passes of evening out path outlines (see smoothOutline).
+const OUTLINE_PASSES = 2;
 // Overlay tiles blend with similar overlay tiles this close by.
 const OVERLAY_BLEND_RADIUS = 2;
 const OVERLAY_SIMILARITY = 0.2;
@@ -31,33 +36,87 @@ const OVERLAY_SIMILARITY = 0.2;
 // (-50, -10, -50) with RS axes converted.
 const LIGHT = [-50, 10, 50];
 // Corner lightness = 74 + (unit normal . light * 256) / 214 (client values);
-// flat ground comes out at 86, which is treated as the texture's own colour.
+// flat ground comes out at 86, which is treated as the tile's own colour.
 const BASE_LIGHTNESS = 74;
 const LIGHT_DIVISOR = 214;
 const FLAT_LIGHTNESS = 86;
 // RS units per tile, for converting our heights to the client's scale.
 const RS_UNITS_PER_TILE = 128;
-// Tiles below this alpha are holes in the ground (the shader discards them).
+// Tiles below this alpha are holes in the ground (water shows through).
 const HOLE_ALPHA = 130;
+// The client's made-up heights: getTileHeight's 10-60 times 8 RS units.
+const NOISE_HEIGHT_SCALE = 8;
+// Underlay variation: hue and lightness drift over patches this many tiles
+// across, by up to these amounts.
+const VARIATION_SCALE = 6;
+const VARIATION_HUE = 0.012;
+const VARIATION_LIGHTNESS = 0.07;
 
-// Surface grain is applied in square clusters of this many pixels, so it
-// reads as pixel-art texture rather than fine noise.
-const GRAIN_BLOCK = 3;
-// Per surface: overall grain strength, and the chance and brightness of
-// lighter and darker specks (grass blades, pebbles).
-const SURFACES = {
-  grass: { grain: 0.035, light: [0.04, 1.07], dark: [0.025, 0.91] },
-  earth: { grain: 0.035, light: [0.015, 1.07], dark: [0.03, 0.86] },
-  stone: { grain: 0.03, light: [0.015, 1.06], dark: [0.02, 0.88] }
-};
+// The client's height noise (PerlinNoise in the 2009 client): hashed values
+// smoothed over their neighbours, cosine-interpolated, in three octaves.
+const COSINE = Int32Array.from({ length: 2048 }, (_, i) => Math.trunc(Math.cos(i * 0.0030679615) * 65536));
 
-// Which surface a tile colour is: green is grass, near-grey is stone, the rest
-// (browns, yellows) is earth.
+function noiseAt(x, y) {
+  const n = (y * 57 + x) | 0;
+  const h = n ^ (n << 13);
+  const result = (Math.imul(Math.imul(Math.imul(h, h), 15731) + 789221 | 0, h) + 1376312589) & 0x7fffffff;
+  return (result >> 19) & 0xff;
+}
+
+function smoothNoise(x, y) {
+  const corners = noiseAt(x - 1, y - 1) + noiseAt(x + 1, y - 1) + noiseAt(x - 1, y + 1) + noiseAt(x + 1, y + 1);
+  const sides = noiseAt(x - 1, y) + noiseAt(x + 1, y) + noiseAt(x, y - 1) + noiseAt(x, y + 1);
+  return Math.trunc(sides / 8) + Math.trunc(corners / 16) + Math.trunc(noiseAt(x, y) / 4);
+}
+
+function interpolate(a, b, t, scale) {
+  const weight = (65536 - COSINE[Math.trunc((t * 1024) / scale)]) >> 1;
+  return ((a * (65536 - weight)) >> 16) + ((b * weight) >> 16);
+}
+
+function interpolatedNoise(frequency, x, y) {
+  const gridX = Math.trunc(x / frequency), gridY = Math.trunc(y / frequency);
+  const fracX = x & (frequency - 1), fracY = y & (frequency - 1);
+  const top = interpolate(smoothNoise(gridX, gridY), smoothNoise(gridX + 1, gridY), fracX, frequency);
+  const bottom = interpolate(smoothNoise(gridX, gridY + 1), smoothNoise(gridX + 1, gridY + 1), fracX, frequency);
+  return interpolate(top, bottom, fracY, frequency);
+}
+
+// Height (10-60) the client gives a tile corner with no height of its own;
+// the scene builder calls it with these offsets from the world position.
+function noiseHeight(worldX, worldY) {
+  const x = worldX + 932731, y = worldY + 556238;
+  let height = interpolatedNoise(4, y + 45365, x + 91923) + ((interpolatedNoise(2, y + 10294, x + 37821) - 128) >> 1) + ((interpolatedNoise(1, y, x) - 128) >> 2) - 128;
+  height = Math.trunc(height * 0.3) + 35;
+  return Math.min(60, Math.max(10, height));
+}
+
+// Moves the game's ground colours toward OSRS's palette, keeping their own
+// light and dark: grass toward a lighter olive green, earth toward brown.
+function osrsPalette([h, s, l], surface) {
+  if (surface === "grass") return [h + (0.255 - h) * 0.6, 0.25 + s * 0.3, 0.18 + l * 0.5];
+  if (surface === "earth") return [h + (0.08 - h) * 0.5, 0.2 + s * 0.35, 0.12 + l * 0.75];
+  return [h, s * 0.5, l];
+}
+
+// Snaps a colour to the client's 16-bit HSL (64 hues, 8 saturations, 128
+// lightnesses), decoded as its palette does (hue and saturation at the middle
+// of their step). Neighbouring tiles land on different steps, which gives
+// OSRS ground its small colour shifts from tile to tile.
+function toHsl16(h, s, l) {
+  const hue = Math.min(63, Math.max(0, Math.floor((((h % 1) + 1) % 1) * 64)));
+  const saturation = Math.min(7, Math.max(0, Math.floor(s * 8)));
+  const lightness = Math.min(127, Math.max(0, Math.floor(l * 128)));
+  return [hue / 64 + 1 / 128, saturation / 8 + 1 / 16, lightness / 128];
+}
+
+// Which kind of surface a tile colour is: green is grass, near-grey is stone,
+// the rest (browns, yellows) is earth.
 function surfaceOf(r, g, b) {
   const max = Math.max(r, g, b), min = Math.min(r, g, b);
-  if (max - min < 0.07) return SURFACES.stone;
-  if (g >= r && g > b) return SURFACES.grass;
-  return SURFACES.earth;
+  if (max - min < 0.07) return "stone";
+  if (g >= r && g > b) return "grass";
+  return "earth";
 }
 
 function hash(x, y) {
@@ -65,14 +124,16 @@ function hash(x, y) {
   return value - Math.floor(value);
 }
 
-// Brightness factor for one grain cluster.
-function grainAt(surface, gx, gy) {
-  const n = hash(gx * 1.37 + 11.1, gy * 0.71 + 3.3);
-  const speck = hash(gx * 0.53 + 101.7, gy * 1.91 + 47.2);
-  let factor = 1 + surface.grain * (n * 2 - 1);
-  if (speck < surface.light[0]) factor *= surface.light[1];
-  else if (speck > 1 - surface.dark[0]) factor *= surface.dark[1];
-  return factor;
+// Smooth noise in -1..1: random values on a grid, interpolated with a
+// smoothstep between them.
+function valueNoise(x, y) {
+  const x0 = Math.floor(x), y0 = Math.floor(y);
+  const fx = x - x0, fy = y - y0;
+  const sx = fx * fx * (3 - 2 * fx), sy = fy * fy * (3 - 2 * fy);
+  const corner = (cx, cy) => hash(cx * 0.913 + 7.7, cy * 1.177 + 19.3) * 2 - 1;
+  const top = corner(x0, y0) + (corner(x0 + 1, y0) - corner(x0, y0)) * sx;
+  const bottom = corner(x0, y0 + 1) + (corner(x0 + 1, y0 + 1) - corner(x0, y0 + 1)) * sx;
+  return top + (bottom - top) * sy;
 }
 
 function rgbToHsl(r, g, b) {
@@ -102,16 +163,10 @@ function hslToRgb(h, s, l) {
   return [channel(h + 1 / 3), channel(h), channel(h - 1 / 3)];
 }
 
-async function readImage(url) {
-  const image = await new Promise((resolve, reject) => {
-    const element = new Image();
-    element.onload = () => resolve(element);
-    element.onerror = reject;
-    element.src = url;
-  });
-  const canvas = document.createElement("canvas");
-  canvas.width = image.width;
-  canvas.height = image.height;
+// Reads an image's pixels.
+export async function readImage(url) {
+  const image = await createImageBitmap(await (await fetch(url)).blob());
+  const canvas = new OffscreenCanvas(image.width, image.height);
   const context = canvas.getContext("2d", { willReadFrequently: true });
   context.drawImage(image, 0, 0);
   return { pixels: context.getImageData(0, 0, image.width, image.height).data, width: image.width, height: image.height };
@@ -175,18 +230,52 @@ function blendTiles(tiles, tilesX, tilesY, radius, include) {
   return blended;
 }
 
-// Paints the OSRS-style ground for one map region.
-//   textureUrl: the game's ground colours, one pixel per tile.
-//   heightMapUrl: the region's heightmap (grey = height).
-//   heightRange: world height of a white heightmap pixel.
-//   tileVisibility: 0-1, a random lightness jitter per corner on top of the
-//     client's lighting, to make the tile grid more or less visible.
-// Returns a canvas in the same orientation as the source texture.
-export async function paintTerrain(textureUrl, heightMapUrl, heightRange, tileVisibility = 0.5) {
-  const colors = await readImage(textureUrl);
-  const heights = await readImage(heightMapUrl);
+// Average of HSL colours, hue weighted by chroma (as the client blends).
+function averageHsl(colorList) {
+  let hue = 0, chroma = 0, saturation = 0, lightness = 0;
+  for (const [h, s, l] of colorList) {
+    const c = s * (1 - Math.abs(2 * l - 1));
+    hue += h * c;
+    chroma += c;
+    saturation += s;
+    lightness += l;
+  }
+  const count = colorList.length;
+  return [chroma > 0 ? hue / chroma : 0, saturation / count, lightness / count];
+}
+
+// Evens out a path outline: a tile whose sides are three or four of the other
+// kind joins them, which removes one-tile notches and bumps (OSRS paths have
+// none); corner cuts then make the edges straight diagonals.
+function smoothOutline(overlay, solid, tilesX, tilesY) {
+  let current = overlay;
+  for (let pass = 0; pass < OUTLINE_PASSES; pass++) {
+    current = current.map((self, i) => {
+      if (!solid[i]) return self;
+      const x = i % tilesX, y = Math.floor(i / tilesX);
+      let other = 0;
+      for (const [dx, dy] of [[0, -1], [0, 1], [-1, 0], [1, 0]]) {
+        const nx = x + dx, ny = y + dy;
+        if (nx >= 0 && ny >= 0 && nx < tilesX && ny < tilesY && solid[ny * tilesX + nx] && current[ny * tilesX + nx] !== self) other++;
+      }
+      return other >= 3 ? !self : self;
+    });
+  }
+  return current;
+}
+
+// Builds the OSRS-style ground for one map region.
+//   colors: the game's ground colours, one pixel per tile ({ pixels, width, height }).
+//   cornerPosition(cx, cy): [x, y, z] of a tile corner in the ground's space
+//     (corner 0, 0 is the image's top-left).
+//   worldOrigin: world tile coordinates of corner 0, 0 ({ x, y }, y growing
+//     down the image), so the height noise lines up across regions.
+//   tileVisibility: 0-1, strength of the height noise in the lighting (0.5
+//     is the client's own), which makes the tiles more or less visible.
+// Returns vertex data in the ground's space: positions, colors (RGBA), indices.
+export function buildOsrsGround(colors, cornerPosition, worldOrigin, tileVisibility = 0.5) {
   const tilesX = colors.width, tilesY = colors.height;
-  const at = (x, y) => (Math.min(tilesY - 1, Math.max(0, y)) * tilesX + Math.min(tilesX - 1, Math.max(0, x))) * 4;
+  const cornersX = tilesX + 1;
 
   // Each tile's own colour (HSL), and which tiles are solid ground.
   const own = [], solid = [];
@@ -195,71 +284,60 @@ export async function paintTerrain(textureUrl, heightMapUrl, heightRange, tileVi
     solid.push(colors.pixels[p + 3] >= HOLE_ALPHA);
     own.push(rgbToHsl(colors.pixels[p] / 255, colors.pixels[p + 1] / 255, colors.pixels[p + 2] / 255));
   }
+  // Surfaces are judged on the game's colours; blending uses OSRS's palette.
   const rgb = own.map((hsl) => hslToRgb(...hsl));
+  const surfaces = rgb.map((color) => surfaceOf(...color));
+  for (let i = 0; i < own.length; i++) own[i] = osrsPalette(own[i], surfaces[i]);
   const distance = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
 
-  // Tiles that clearly stand out from their surroundings are overlays (paths,
-  // dirt patches, floors).
-  const surroundings = blendTiles(own, tilesX, tilesY, BLEND_RADIUS, (i) => solid[i]);
-  const overlay = own.map((_, i) => solid[i] && !!surroundings[i] && distance(rgb[i], hslToRgb(...surroundings[i])) > OVERLAY_DISTANCE);
+  // Grass is underlay; everything else is overlay. Colours come from the
+  // tiles as the game painted them; the outline is then evened out.
+  const painted = surfaces.map((surface, i) => solid[i] && surface !== "grass");
+  const overlay = smoothOutline(painted, solid, tilesX, tilesY);
 
   // Underlays blend with underlays only (the client's 11x11); overlays blend a
-  // little with nearby overlay tiles of a similar colour, so a path is one
-  // even colour with crisp edges against the grass.
-  const underlayBlend = blendTiles(own, tilesX, tilesY, BLEND_RADIUS, (i) => solid[i] && !overlay[i]);
+  // little with nearby overlay tiles of a similar colour.
+  const underlayBlend = blendTiles(own, tilesX, tilesY, BLEND_RADIUS, (i) => solid[i] && !painted[i]);
   const overlayBlend = blendTiles(own, tilesX, tilesY, OVERLAY_BLEND_RADIUS,
-    (i, center) => solid[i] && overlay[i] && distance(rgb[i], rgb[center]) < OVERLAY_SIMILARITY);
-  const tileColor = own.map((hsl, i) => (overlay[i] ? overlayBlend[i] : underlayBlend[i]) ?? hsl);
+    (i, center) => solid[i] && painted[i] && distance(rgb[i], rgb[center]) < OVERLAY_SIMILARITY);
 
-  // Shaped overlay edges, in the spirit of the client's diagonal tile shapes:
-  // each tile corner scores how many of the four tiles around it are overlay,
-  // the score is interpolated across each tile, and pixels above one half are
-  // overlay. Edges then run along diagonals and gentle curves, not steps.
-  const isOverlay = (x, y) => x >= 0 && y >= 0 && x < tilesX && y < tilesY && overlay[y * tilesX + x];
-  const cornerScore = new Float32Array((tilesX + 1) * (tilesY + 1));
+  // Colours at each tile corner, from the tiles around it: underlay (with the
+  // gentle variation added) and overlay. Paths shade smoothly between
+  // corners like grass does, while their edges stay crisp.
+  const cornerUnder = new Array(cornersX * (tilesY + 1));
+  const cornerOver = new Array(cornersX * (tilesY + 1));
   for (let cy = 0; cy <= tilesY; cy++) {
     for (let cx = 0; cx <= tilesX; cx++) {
-      let count = 0, total = 0;
+      const unders = [], overs = [];
       for (const [x, y] of [[cx - 1, cy - 1], [cx, cy - 1], [cx - 1, cy], [cx, cy]]) {
         if (x < 0 || y < 0 || x >= tilesX || y >= tilesY) continue;
-        total++;
-        if (overlay[y * tilesX + x]) count++;
+        const i = y * tilesX + x;
+        if (!solid[i]) continue;
+        if (painted[i]) overs.push(overlayBlend[i] ?? own[i]);
+        else if (underlayBlend[i]) unders.push(underlayBlend[i]);
       }
-      cornerScore[cy * (tilesX + 1) + cx] = total ? count / total : 0;
+      const c = cy * cornersX + cx;
+      if (overs.length) cornerOver[c] = averageHsl(overs);
+      if (unders.length) {
+        const [h, s, l] = averageHsl(unders);
+        const hueShift = VARIATION_HUE * valueNoise(cx / VARIATION_SCALE + 31.4, cy / VARIATION_SCALE + 2.7);
+        const lightShift = 1 + VARIATION_LIGHTNESS * valueNoise(cx / VARIATION_SCALE, cy / VARIATION_SCALE);
+        cornerUnder[c] = [h + hueShift, s, l * lightShift];
+      }
     }
   }
-  // Each tile's overlay and underlay colours: its own for its own side, and
-  // for the other side the nearest neighbour's (or the blended underlay).
-  const neighbours = [[0, -1], [-1, 0], [1, 0], [0, 1], [-1, -1], [1, -1], [-1, 1], [1, 1]];
-  const sideColors = own.map((_, i) => {
-    const x = i % tilesX, y = Math.floor(i / tilesX);
-    if (!overlay[i]) {
-      const near = neighbours.find(([dx, dy]) => isOverlay(x + dx, y + dy));
-      return { under: tileColor[i], over: near ? tileColor[(y + near[1]) * tilesX + x + near[0]] : tileColor[i] };
-    }
-    return { over: tileColor[i], under: underlayBlend[i] ?? tileColor[i] };
-  });
 
-  // Height at a tile corner in RS units, from the heightmap.
-  const heightAt = (cornerX, cornerY) => {
-    const fx = Math.min(heights.width - 1, Math.max(0, cornerX / tilesX * (heights.width - 1)));
-    const fy = Math.min(heights.height - 1, Math.max(0, cornerY / tilesY * (heights.height - 1)));
-    const x0 = Math.floor(fx), y0 = Math.floor(fy);
-    const x1 = Math.min(heights.width - 1, x0 + 1), y1 = Math.min(heights.height - 1, y0 + 1);
-    const value = (x, y) => heights.pixels[(y * heights.width + x) * 4] / 255 * heightRange;
-    const tx = fx - x0, ty = fy - y0;
-    const top = value(x0, y0) + (value(x1, y0) - value(x0, y0)) * tx;
-    const bottom = value(x0, y1) + (value(x1, y1) - value(x0, y1)) * tx;
-    return (top + (bottom - top) * ty) * RS_UNITS_PER_TILE;
+  // Corner lightness factors (1.0 on flat ground), from the slope of the
+  // land plus the client's height noise.
+  const noiseStrength = tileVisibility * 2;
+  const heightAt = (cx, cy) => {
+    const land = cornerPosition(Math.min(tilesX, Math.max(0, cx)), Math.min(tilesY, Math.max(0, cy)))[1] * RS_UNITS_PER_TILE;
+    return land + noiseStrength * NOISE_HEIGHT_SCALE * noiseHeight(worldOrigin.x + cx, worldOrigin.y + cy);
   };
-
-  // Corner lightness factors (1.0 on flat ground), from the slope.
   const lightLength = Math.hypot(...LIGHT);
-  const cornersX = tilesX + 1, cornersY = tilesY + 1;
-  const cornerLight = new Float32Array(cornersX * cornersY);
-  const jitter = 0.1 * tileVisibility;
-  for (let cy = 0; cy < cornersY; cy++) {
-    for (let cx = 0; cx < cornersX; cx++) {
+  const cornerLight = new Float32Array(cornersX * (tilesY + 1));
+  for (let cy = 0; cy <= tilesY; cy++) {
+    for (let cx = 0; cx <= tilesX; cx++) {
       const dx = heightAt(cx + 1, cy) - heightAt(cx - 1, cy);
       const dz = heightAt(cx, cy + 1) - heightAt(cx, cy - 1);
       // Unit normal of the slope over the two tiles either side (256 RS units).
@@ -268,56 +346,67 @@ export async function paintTerrain(textureUrl, heightMapUrl, heightRange, tileVi
       const dot = normal[0] * LIGHT[0] + normal[1] * LIGHT[1] + normal[2] * LIGHT[2];
       // The client divides by 214 for its 71-unit light; scale for ours.
       const lightness = BASE_LIGHTNESS + (dot * 256 / lightLength * Math.hypot(50, 10, 50)) / LIGHT_DIVISOR;
-      cornerLight[cy * cornersX + cx] = lightness / FLAT_LIGHTNESS * (1 + jitter * (hash(cx, cy) * 2 - 1));
+      cornerLight[cy * cornersX + cx] = lightness / FLAT_LIGHTNESS;
     }
   }
 
-  // Shade each tile's two triangles: its colour, lightness interpolated
-  // between corners, split from the south-west corner to the north-east.
-  const size = PIXELS_PER_TILE;
-  const canvas = document.createElement("canvas");
-  canvas.width = tilesX * size;
-  canvas.height = tilesY * size;
-  const context = canvas.getContext("2d");
-  const output = context.createImageData(canvas.width, canvas.height);
-  const out = output.data;
-  const lightAt = (cx, cy) => cornerLight[cy * cornersX + cx];
+  const positions = [], vertexColors = [];
+  const vertex = ([cx, cy], hsl) => {
+    positions.push(...cornerPosition(cx, cy));
+    const light = cornerLight[cy * cornersX + cx];
+    const [r, g, b] = hslToRgb(...toHsl16(hsl[0], hsl[1], Math.min(0.99, Math.max(0.01, hsl[2] * light))));
+    vertexColors.push(r, g, b, 1);
+  };
+  // A triangle of overlay or underlay, coloured per corner (the other kind's
+  // colour, then the tile's own, where a corner has none of its kind).
+  const triangle = (corners, asOverlay, i) => {
+    for (const [cx, cy] of corners) {
+      const c = cy * cornersX + cx;
+      vertex([cx, cy], (asOverlay ? cornerOver[c] ?? cornerUnder[c] : cornerUnder[c] ?? cornerOver[c]) ?? own[i]);
+    }
+  };
+
+  const isOverlay = (x, y, self) => {
+    if (x < 0 || y < 0 || x >= tilesX || y >= tilesY || !solid[y * tilesX + x]) return self;
+    return overlay[y * tilesX + x];
+  };
+  // Each tile corner's half of a tile cut corner to corner, then the rest.
+  const HALVES = {
+    NW: (c) => [[c.NW, c.NE, c.SW], [c.NE, c.SE, c.SW]],
+    SE: (c) => [[c.NE, c.SE, c.SW], [c.NW, c.NE, c.SW]],
+    NE: (c) => [[c.NW, c.NE, c.SE], [c.NW, c.SE, c.SW]],
+    SW: (c) => [[c.NW, c.SE, c.SW], [c.NW, c.NE, c.SE]]
+  };
   for (let ty = 0; ty < tilesY; ty++) {
     for (let tx = 0; tx < tilesX; tx++) {
-      const index = ty * tilesX + tx;
-      const sides = sideColors[index];
-      const score = (cx, cy) => cornerScore[cy * (tilesX + 1) + cx];
-      const s00 = score(tx, ty), s10 = score(tx + 1, ty), s01 = score(tx, ty + 1), s11 = score(tx + 1, ty + 1);
-      // Ties go to the tile's own side.
-      const bias = overlay[index] ? 0.001 : -0.001;
-      const p = at(tx, ty);
-      const surface = surfaceOf(colors.pixels[p] / 255, colors.pixels[p + 1] / 255, colors.pixels[p + 2] / 255);
-      const topLeft = lightAt(tx, ty), topRight = lightAt(tx + 1, ty);
-      const bottomLeft = lightAt(tx, ty + 1), bottomRight = lightAt(tx + 1, ty + 1);
-      for (let py = 0; py < size; py++) {
-        const v = (py + 0.5) / size;
-        for (let px = 0; px < size; px++) {
-          const u = (px + 0.5) / size;
-          const o = ((ty * size + py) * canvas.width + tx * size + px) * 4;
-          if (!solid[index]) {
-            out[o + 3] = 0;
-            continue;
-          }
-          const light = u + v <= 1
-            ? topLeft + (topRight - topLeft) * u + (bottomLeft - topLeft) * v
-            : bottomRight + (bottomLeft - bottomRight) * (1 - u) + (topRight - bottomRight) * (1 - v);
-          const grain = grainAt(surface, Math.floor((tx * size + px) / GRAIN_BLOCK), Math.floor((ty * size + py) / GRAIN_BLOCK));
-          const overlayAmount = (s00 * (1 - u) + s10 * u) * (1 - v) + (s01 * (1 - u) + s11 * u) * v + bias;
-          const [h, s, l] = overlayAmount > 0.5 ? sides.over : sides.under;
-          const [r, g, b] = hslToRgb(h, s, Math.min(0.99, Math.max(0.01, l * light * grain)));
-          out[o] = Math.round(r * 255);
-          out[o + 1] = Math.round(g * 255);
-          out[o + 2] = Math.round(b * 255);
-          out[o + 3] = 255;
-        }
+      const i = ty * tilesX + tx;
+      if (!solid[i]) continue;
+      const self = overlay[i];
+      const corners = { NW: [tx, ty], NE: [tx + 1, ty], SW: [tx, ty + 1], SE: [tx + 1, ty + 1] };
+      // Neighbours of the other kind, by side.
+      const n = isOverlay(tx, ty - 1, self) !== self, s = isOverlay(tx, ty + 1, self) !== self;
+      const w = isOverlay(tx - 1, ty, self) !== self, e = isOverlay(tx + 1, ty, self) !== self;
+      // A grass tile with path on exactly two touching sides is cut corner to
+      // corner and that corner's half is path, so a stepped path edge becomes
+      // one straight diagonal. (Cutting path tiles too would leave two
+      // diagonals a tile apart: a zigzag.)
+      let corner = null;
+      if (self) corner = null;
+      else if (n && w && !s && !e) corner = "NW";
+      else if (n && e && !s && !w) corner = "NE";
+      else if (s && w && !n && !e) corner = "SW";
+      else if (s && e && !n && !w) corner = "SE";
+      if (!corner) {
+        // Two triangles, split from the south-west corner to the north-east.
+        triangle([corners.NW, corners.NE, corners.SW], self, i);
+        triangle([corners.NE, corners.SE, corners.SW], self, i);
+        continue;
       }
+      const [cornerHalf, rest] = HALVES[corner](corners);
+      triangle(cornerHalf, !self, i);
+      triangle(rest, self, i);
     }
   }
-  context.putImageData(output, 0, 0);
-  return canvas;
+  const indices = Array.from({ length: positions.length / 3 }, (_, k) => k);
+  return { positions, colors: vertexColors, indices };
 }

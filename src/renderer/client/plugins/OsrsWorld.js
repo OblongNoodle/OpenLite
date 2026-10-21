@@ -6,7 +6,7 @@
 // - terrain: one crisp colour per tile and faceted (flat-shaded) hills;
 // - objects: textures baked into one flat colour per face, like OSRS models.
 import { Plugin, SettingsTypes } from "@highlite/core";
-import { buildTerrainGeometry, paintTerrain } from "./osrsworld/terrain.js";
+import { buildOsrsGround, buildTerrainGeometry, readImage } from "./osrsworld/terrain.js";
 import { osrsStyleTexture } from "./osrsworld/textures.js";
 import { MODEL_DEFAULT_TEXTURES, OSRS_TEXTURE_FOR, osrsTextureCanvas } from "./osrsworld/osrsTextures.js";
 import { OsrsFences } from "./osrsworld/fences.js";
@@ -23,6 +23,8 @@ const MAX_BAKE_TRANSPARENCY = 0.25;
 const BAKE_SCAN_INTERVAL_MS = 1000;
 // How often to check for fences that loaded or unloaded.
 const FENCE_UPDATE_INTERVAL_MS = 500;
+// Names ending in "-halo" are skipped by the game's click picking.
+const OSRS_GROUND_NAME = "osrsworld-ground-halo";
 
 function hexToRgb(hex) {
   const value = parseInt(String(hex).replace("#", ""), 16);
@@ -157,7 +159,7 @@ var OsrsWorld = class extends Plugin {
     this.removeFences();
     this.osrsSceneryMaterial?.dispose();
     this.osrsSceneryMaterial = null;
-    this.restoreGroundTexture();
+    this.removeOsrsGround();
     if (this.groundMesh) this.setGroundSampling(this.groundMesh, BILINEAR_SAMPLING);
     this.groundMesh = null;
   }
@@ -203,7 +205,17 @@ var OsrsWorld = class extends Plugin {
         .finally(() => (this.bakeInProgress = false));
     }
     this.updateAtmosphere(scene);
+    this.updateSceneryBrightness();
     this.updateFences(scene);
+  }
+
+  // OSRS scenery and ground have their lighting baked in; their brightness
+  // follows the scene's light level (dim in caves).
+  updateSceneryBrightness() {
+    const light = this.atmosphere?.HemisphericLight;
+    if (!light || !this.osrsSceneryMaterial) return;
+    const level = (channel) => Math.min(1, Math.max(0.45, light.diffuse[channel] * light.intensity * 1.1));
+    this.osrsSceneryMaterial.emissiveColor.set(level("r"), level("g"), level("b"));
   }
 
   // OSRS fence objects in place of the game's fence walls (see fences.js).
@@ -211,11 +223,6 @@ var OsrsWorld = class extends Plugin {
     if (!this.settings.osrsFences.value || !window.osrsCache) return;
     const material = this.sceneryMaterial(scene);
     if (!material) return;
-    const light = this.atmosphere?.HemisphericLight;
-    if (light) {
-      const level = (channel) => Math.min(1, Math.max(0.45, light.diffuse[channel] * light.intensity * 1.1));
-      material.emissiveColor.set(level("r"), level("g"), level("b"));
-    }
     if (performance.now() - (this.lastFenceUpdate ?? 0) < FENCE_UPDATE_INTERVAL_MS) return;
     this.lastFenceUpdate = performance.now();
     this.fences ??= new OsrsFences(scene, () => this.gameHooks.WorldEntityManager?.Instance?.WorldEntities);
@@ -340,7 +347,7 @@ var OsrsWorld = class extends Plugin {
 
     const ground = scene.getMeshByName(GROUND_MESH_NAME);
     if (!ground || ground === this.groundMesh) return;
-    this.restoreGroundTexture();
+    this.removeOsrsGround();
     this.groundMesh = ground;
     this.upgradeGroundGeometry(ground)
       .catch((error) => this.error("Rebuilding terrain failed", error))
@@ -378,43 +385,57 @@ var OsrsWorld = class extends Plugin {
   refreshGround() {
     if (!this.groundMesh) return;
     if (this.settings.osrsTerrain.value) {
-      this.paintGround(this.groundMesh).catch((error) => this.error("Painting terrain failed", error));
+      this.buildGround(this.groundMesh).catch((error) => this.error("Building terrain failed", error));
     } else {
-      this.restoreGroundTexture();
+      this.removeOsrsGround();
       this.applyGroundSampling();
     }
   }
 
-  // Replaces the ground texture with an OSRS-style painted one (see
-  // osrsworld/terrain.js), keeping the original to put back later.
-  async paintGround(ground) {
+  // Draws the region's ground the OSRS way (see osrsworld/terrain.js) in
+  // place of the game's. The game's ground stays in the scene, hidden, for
+  // clicks and height lookups; ours is named so the game's picking skips it.
+  async buildGround(ground) {
     const map = this.gameHooks.WorldMapManager?.Instance;
-    const original = this.originalGroundTexture ?? ground.material?._textures?.groundTexture;
-    if (!map?._textureUrl || !map._heightMapUrl || !original) return;
-    const options = map._groundMeshOptions;
-    const canvas = await paintTerrain(map._textureUrl, map._heightMapUrl, options.maxHeight - options.minHeight, this.settings.tileVisibility.value / 10);
+    if (!map?._textureUrl) return;
+    const colors = await readImage(map._textureUrl);
     if (ground !== this.groundMesh || ground.isDisposed() || !this.settings.osrsTerrain.value) return;
-    const Texture = original.constructor;
-    // Nearest filtering up close keeps the grain crisp, like OSRS textures.
-    const painted = new Texture(canvas.toDataURL(), ground.getScene(), false, original._invertY ?? true, NEAREST_SAMPLING);
-    painted.wrapU = painted.wrapV = original.wrapU;
-    this.restoreGroundTexture();
-    this.originalGroundTexture = original;
-    this.paintedGroundTexture = painted;
-    ground.material.setTexture("groundTexture", painted);
+    const material = this.sceneryMaterial(ground.getScene());
+    if (!material) return;
+    // Tile corners sit on the game ground's own vertices (one row per
+    // subdivision, the first row at the image's top), so heights match.
+    const vertices = ground.getVerticesData("position");
+    const subdivisions = ground._subdivisionsX ?? map._groundMeshOptions.subdivisions;
+    const options = map._groundMeshOptions;
+    const cornerPosition = (cx, cy) => {
+      const col = Math.round((cx / colors.width) * subdivisions), row = Math.round((cy / colors.height) * subdivisions);
+      const y = vertices[(row * (subdivisions + 1) + col) * 3 + 1];
+      return [(cx / colors.width) * options.width - options.width / 2, y, options.height / 2 - (cy / colors.height) * options.height];
+    };
+    // World tile of corner 0, 0 (the image's top-left), for the height noise.
+    const worldOrigin = { x: Math.round(ground.position.x - options.width / 2), y: Math.round(-(ground.position.z + options.height / 2)) };
+    const data = buildOsrsGround(colors, cornerPosition, worldOrigin, this.settings.tileVisibility.value / 10);
+    const Mesh = this.scene.meshes.find((m) => m.getClassName() === "Mesh").constructor;
+    const osrsGround = new Mesh(OSRS_GROUND_NAME, ground.getScene());
+    osrsGround.setVerticesData("position", data.positions, false);
+    osrsGround.setVerticesData("color", data.colors, false);
+    osrsGround.setIndices(data.indices);
+    osrsGround.material = material;
+    osrsGround.isPickable = false;
+    osrsGround.parent = ground;
+    this.removeOsrsGround();
+    this.osrsGround = osrsGround;
+    ground.isVisible = false;
   }
 
-  restoreGroundTexture() {
-    if (this.originalGroundTexture && this.groundMesh && !this.groundMesh.isDisposed()) {
-      this.groundMesh.material?.setTexture("groundTexture", this.originalGroundTexture);
-    }
-    this.paintedGroundTexture?.dispose();
-    this.paintedGroundTexture = null;
-    this.originalGroundTexture = null;
+  removeOsrsGround() {
+    this.osrsGround?.dispose();
+    this.osrsGround = null;
+    if (this.groundMesh && !this.groundMesh.isDisposed()) this.groundMesh.isVisible = true;
   }
 
   applyGroundSampling() {
-    if (!this.groundMesh || this.paintedGroundTexture) return;
+    if (!this.groundMesh || this.osrsGround) return;
     this.setGroundSampling(this.groundMesh, this.settings.tiledGround.value ? NEAREST_SAMPLING : BILINEAR_SAMPLING);
   }
 

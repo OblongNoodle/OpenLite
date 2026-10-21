@@ -74,8 +74,9 @@ export class OsrsFences {
       // wall line, which then runs along its Z axis.
       const centre = (Math.min(...data.vertexX) + Math.max(...data.vertexX)) / 2;
       data.vertexX = data.vertexX.map((x) => x - centre);
+      // "-halo" names are skipped by the game's click picking.
       const Mesh = this.scene.meshes.find((m) => m.getClassName() === "Mesh").constructor;
-      const mesh = createObjectMesh(Mesh, this.scene, data, material, `osrsworld-fence-${objectId}`);
+      const mesh = createObjectMesh(Mesh, this.scene, data, material, `osrsworld-fence-${objectId}-halo`);
       const matrices = entities.flatMap((entity) => this.segmentMatrices(entity));
       mesh.thinInstanceSetBuffer("matrix", new Float32Array(matrices), 16, true);
       mesh.thinInstanceRefreshBoundingInfo(false);
