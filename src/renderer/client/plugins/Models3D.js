@@ -355,7 +355,12 @@ if (import.meta.hot) {
     const instance = entry?.instance;
     if (!updated?.default || !instance) return;
     const wasEnabled = instance.settings.enable.value;
-    if (wasEnabled) instance.stop();
+    // A half-finished edit can leave stop() broken; swap in the new code anyway.
+    try {
+      if (wasEnabled) instance.stop();
+    } catch (error) {
+      console.error("[Models3D] stop() failed during hot swap", error);
+    }
     Object.setPrototypeOf(instance, updated.default.prototype);
     if (wasEnabled) instance.start();
     console.info("[Models3D] Hot-swapped plugin code");
