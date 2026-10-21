@@ -254,7 +254,10 @@ var Models3D = class extends Plugin {
       let record = this.records.get(entity);
       if (!record || record.appearance !== appearance) {
         if (record) this.disposeRecord(record);
-        record = { entity, appearance, type, model: null, specKey: null, pendingKey: null, wasAnimatingAction: false, strikeStart: -Infinity };
+        record = { entity, appearance, type, model: null, specKey: null, pendingKey: null, wasAnimatingAction: false, strikeStart: -Infinity, hitAt: -Infinity };
+        // Every hit the entity takes (misses included) is a block.
+        record.onHit = () => (record.hitAt = performance.now());
+        entity.Hitpoints?.OnReceivedDamageListener?.add(record.onHit);
         this.records.set(entity, record);
       }
       this.updateRecordModel(record);
@@ -277,7 +280,9 @@ var Models3D = class extends Plugin {
         moving: entity.IsMoving,
         activity,
         woodcutting: state === ActionState.WoodcuttingState,
-        strike: strikeElapsed < STRIKE_DURATION_MS ? strikeElapsed / STRIKE_DURATION_MS : null
+        strike: strikeElapsed < STRIKE_DURATION_MS ? strikeElapsed / STRIKE_DURATION_MS : null,
+        strikeStart: record.strikeStart,
+        hitAt: record.hitAt
       };
 
       const position = {
@@ -581,6 +586,7 @@ var Models3D = class extends Plugin {
   }
 
   disposeRecord(record) {
+    record.entity.Hitpoints?.OnReceivedDamageListener?.remove(record.onHit);
     if (record.model) record.model.dispose();
     record.model = null;
     record.pendingKey = null;

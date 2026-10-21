@@ -4,6 +4,7 @@
 // moving labelled vertex groups frame by frame (Model.animate).
 import { Activity } from "../pose.js";
 import { RigModel } from "../geometry.js";
+import { ANIMATION_NAMES } from "./animationNames.js";
 import {
   CacheIndex,
   ConfigArchive,
@@ -13,6 +14,7 @@ import {
   decodeKit,
   decodeModel,
   decodeNpc,
+  decodeObject,
   decodeSequence,
   frameFramemapId
 } from "./definitions.js";
@@ -42,6 +44,13 @@ const SEQUENCES = {
   [Activity.Work]: 899,
   [Activity.Dead]: 836
 };
+// Combat styles: their animation plays once per attack the game reports.
+const COMBAT_ACTIVITIES = new Set([Activity.Melee, Activity.Ranged, Activity.Magic]);
+// Player-skeleton NPCs (men, guards...) fight with the player's own moves.
+const HUMAN_COMBAT = { attack: 422, block: 424, death: 836 };
+// Combat sequence kinds and the name parts that mark them (RAT_ATTACK,
+// GOBLIN_ATTACK_UNARMED, COW_BLOCK, IMP_DEFEND, RAT_DEATH...).
+const COMBAT_KIND = { ATTACK: "attack", BLOCK: "block", DEFEND: "block", DEATH: "death", DIE: "death" };
 // Woodcutting uses its own animation; mining shares the Chop pose family.
 const WOODCUTTING_SEQUENCE = 879;
 // Client ticks are 20ms; frame lengths are counted in them.
@@ -163,6 +172,24 @@ export class OsrsCache {
     this.sequences = new Map(sequenceFiles.map((file) => [file.id, file.data]));
   }
 
+  // Object (loc) definitions by id, decoded on first use.
+  async objects() {
+    if (!this._objects) {
+      this._objects = window.osrsCache.files(CacheIndex.Configs, ConfigArchive.Object).then((files) => {
+        const byId = new Map();
+        for (const file of files ?? []) {
+          try {
+            byId.set(file.id, decodeObject(file.id, file.data));
+          } catch {
+            // Objects using fields not decoded here are simply unavailable.
+          }
+        }
+        return byId;
+      });
+    }
+    return this._objects;
+  }
+
   // Selectable male kits for a body part (the male kits are ids below 45).
   kitsFor(bodyPart) {
     return this.kits.filter((kit) => kit.bodyPartId === bodyPart && !kit.nonSelectable && kit.models.length && kit.id < MALE_KIT_LIMIT);
@@ -178,6 +205,66 @@ export class OsrsCache {
   sequence(id) {
     const data = this.sequences.get(id);
     return data ? decodeSequence(id, data) : null;
+  }
+
+  // The skeleton (framemap) a sequence animates; a sequence only fits models
+  // built for its skeleton.
+  async skeleton(id) {
+    const frameId = this.sequence(id)?.frameIds[0];
+    if (frameId === undefined) return -1;
+    return (await this.frame(frameId))?.framemap.id ?? -1;
+  }
+
+  // Combat sequences by name prefix: RAT -> { attack: [240], block: [241], death: [243] }.
+  get combatByPrefix() {
+    if (!this._combatByPrefix) {
+      this._combatByPrefix = new Map();
+      for (const [id, name] of ANIMATION_NAMES) {
+        const match = /^(.+?)_(ATTACK|BLOCK|DEFEND|DEATH|DIE)(_|$)/.exec(name);
+        if (!match) continue;
+        if (!this._combatByPrefix.has(match[1])) this._combatByPrefix.set(match[1], { attack: [], block: [], death: [] });
+        this._combatByPrefix.get(match[1])[COMBAT_KIND[match[2]]].push(id);
+      }
+    }
+    return this._combatByPrefix;
+  }
+
+  // NPC definitions only name stand and walk animations; the server picks the
+  // rest. Their names share a prefix (RAT_READY, RAT_WALK, RAT_ATTACK...), so
+  // look under the stand and walk names' prefix, then under ever shorter ones
+  // (DOG_UPDATE_SMALL_DOG, DOG_UPDATE), taking the nearest id that
+  // animates the same skeleton.
+  async combatSequences(stand, walk) {
+    const skeleton = await this.skeleton(stand);
+    if (skeleton < 0) return { attack: -1, block: -1, death: -1 };
+    if (skeleton === (await this.skeleton(SEQUENCES.idle))) return HUMAN_COMBAT;
+    const result = { attack: -1, block: -1, death: -1 };
+    const prefixes = [stand, walk]
+      .map((id) => ANIMATION_NAMES.get(id)?.replace(/_(READY|WALK|IDLE|STAND|SWIM)(_.*)?$/, ""))
+      .filter(Boolean);
+    for (const prefix of prefixes) {
+      const parts = prefix.split("_");
+      // A single word (BRAIN, DOG) is too broad: unrelated NPCs share those.
+      for (let length = parts.length; length >= Math.min(2, parts.length); length--) {
+        const missing = Object.keys(result).filter((kind) => result[kind] < 0);
+        if (!missing.length) return result;
+        const base = parts.slice(0, length).join("_");
+        for (const kind of missing) {
+          const candidates = [];
+          for (const [key, found] of this.combatByPrefix) {
+            if (key === base || (length < parts.length && key.startsWith(`${base}_`))) candidates.push(...found[kind]);
+          }
+          candidates.sort((a, b) => Math.abs(a - stand) - Math.abs(b - stand));
+          for (const id of candidates.slice(0, 8)) {
+            if ((await this.skeleton(id)) === skeleton) {
+              result[kind] = id;
+              break;
+            }
+          }
+        }
+      }
+    }
+    return result;
   }
 
   // Frames are stored in archives of related frames; framemaps (skeletons)
@@ -217,7 +304,7 @@ export class OsrsCache {
 // --- Building ----------------------------------------------------------------
 
 // Merges decoded models into one, like the client's RawModel(models, count).
-function mergeModels(models) {
+export function mergeModels(models) {
   const merged = { vertexX: [], vertexY: [], vertexZ: [], groups: [], faceA: [], faceB: [], faceC: [], colors: [], renderTypes: [], alphas: [] };
   for (const model of models) {
     const base = merged.vertexX.length;
@@ -239,13 +326,13 @@ function mergeModels(models) {
   return merged;
 }
 
-function recolor(model, find, replace) {
+export function recolor(model, find, replace) {
   for (let f = 0; f < model.colors.length; f++) if (model.colors[f] === find) model.colors[f] = replace;
 }
 
 // The client's lighting: each face gets a colour per corner from the
 // vertex normals (smooth faces) or its own normal (flat faces).
-function lightModel(model, { ambient, contrast, x: lx, y: ly, z: lz }) {
+export function lightModel(model, { ambient, contrast, x: lx, y: ly, z: lz }) {
   const vertexCount = model.vertexX.length, faceCount = model.colors.length;
   const nx = new Float64Array(vertexCount), ny = new Float64Array(vertexCount), nz = new Float64Array(vertexCount), count = new Int32Array(vertexCount);
   const faceNormals = [];
@@ -418,7 +505,11 @@ export async function buildNpcData(cache, npc) {
     if (!merged.labels.has(label)) merged.labels.set(label, []);
     merged.labels.get(label).push(v);
   });
-  merged.sequences = { idle: npc.standAnimation, walk: npc.walkAnimation >= 0 ? npc.walkAnimation : npc.standAnimation };
+  merged.sequences = {
+    idle: npc.standAnimation,
+    walk: npc.walkAnimation >= 0 ? npc.walkAnimation : npc.standAnimation,
+    ...(await cache.combatSequences(npc.standAnimation, npc.walkAnimation))
+  };
   return merged;
 }
 
@@ -563,14 +654,38 @@ export class OsrsPlayerModel extends RigModel {
     this.mesh.updateVerticesData("position", p);
   }
 
-  // NPCs bring their own stand and walk animations; players use the player
-  // set, with an animation per activity.
-  sequenceFor(pose) {
-    const npcSequences = this.data.sequences;
-    if (npcSequences) return pose.moving ? npcSequences.walk : npcSequences.idle;
-    if (pose.moving) return SEQUENCES.walk;
+  // The animation for what the entity is doing: NPCs bring their own stand,
+  // walk and death animations; players use the player set, one per activity.
+  // Fighters stand ready between attacks.
+  baseSequence(pose) {
+    const npc = this.data.sequences;
+    if (pose.activity === Activity.Dead) return npc ? npc.death : SEQUENCES[Activity.Dead];
+    if (pose.moving) return npc ? npc.walk : SEQUENCES.walk;
+    if (npc) return npc.idle;
     if (pose.activity === Activity.Chop && pose.woodcutting) return WOODCUTTING_SEQUENCE;
+    if (COMBAT_ACTIVITIES.has(pose.activity)) return SEQUENCES.idle;
     return SEQUENCES[pose.activity] ?? SEQUENCES.idle;
+  }
+
+  // The animation a new attack plays once (-1 for none): an NPC's own attack,
+  // or the player's for their combat style.
+  attackSequence(pose) {
+    if (this.data.sequences) return pose.activity === Activity.Dead ? -1 : this.data.sequences.attack;
+    return COMBAT_ACTIVITIES.has(pose.activity) ? SEQUENCES[pose.activity] : -1;
+  }
+
+  // Starts an animation over from its first frame, then back to the base one.
+  playOnce(id) {
+    this.oneShot = id;
+    this.current = null;
+  }
+
+  blockSequence() {
+    return this.data.sequences ? this.data.sequences.block : HUMAN_COMBAT.block;
+  }
+
+  isDeath(id) {
+    return id === (this.data.sequences ? this.data.sequences.death : SEQUENCES[Activity.Dead]);
   }
 
   animation(id) {
@@ -591,7 +706,23 @@ export class OsrsPlayerModel extends RigModel {
     );
     this.place(position, direction, { x: size, y: size, z: size }, deltaMs);
 
-    const id = this.sequenceFor(pose);
+    // Each attack the game reports plays its animation once, unless the entity
+    // walks off; then the base animation resumes.
+    if (pose.strike !== null && pose.strikeStart !== this.strikeStart) {
+      this.strikeStart = pose.strikeStart;
+      const attack = this.attackSequence(pose);
+      if (attack >= 0) this.playOnce(attack);
+    }
+    // A hit plays the block, unless the entity is in the middle of attacking.
+    if (pose.hitAt !== undefined && pose.hitAt !== this.hitAt) {
+      const first = this.hitAt === undefined;
+      this.hitAt = pose.hitAt;
+      const block = this.blockSequence();
+      if (!first && block >= 0 && this.oneShot !== this.attackSequence(pose)) this.playOnce(block);
+    }
+    if (pose.moving || pose.activity === Activity.Dead) this.oneShot = null;
+    let id = this.oneShot ?? this.baseSequence(pose);
+    if (id === undefined || id < 0) id = this.data.sequences?.idle ?? SEQUENCES.idle;
     if (id !== this.current) {
       this.current = id;
       this.elapsed = 0;
@@ -600,8 +731,12 @@ export class OsrsPlayerModel extends RigModel {
     if (!frames) return;
     this.elapsed += deltaMs;
     const total = frames.reduce((sum, f) => sum + f.ms, 0);
+    if (id === this.oneShot && this.elapsed >= total) {
+      this.oneShot = null;
+      return;
+    }
     // Death plays once and holds its last frame.
-    let t = id === SEQUENCES[Activity.Dead] ? Math.min(this.elapsed, total - 1) : this.elapsed % total;
+    let t = this.isDeath(id) ? Math.min(this.elapsed, total - 1) : this.elapsed % total;
     let index = 0;
     while (index < frames.length - 1 && t >= frames[index].ms) {
       t -= frames[index].ms;

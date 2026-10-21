@@ -8,6 +8,8 @@
 import { Plugin, SettingsTypes } from "@highlite/core";
 import { buildTerrainGeometry, paintTerrain } from "./osrsworld/terrain.js";
 import { osrsStyleTexture } from "./osrsworld/textures.js";
+import { MODEL_DEFAULT_TEXTURES, OSRS_TEXTURE_FOR, osrsTextureCanvas } from "./osrsworld/osrsTextures.js";
+import { OsrsFences } from "./osrsworld/fences.js";
 
 // Map levels in the client.
 const MapLevel = { EarthUnderground: 0, EarthOverworld: 1, EarthSky: 2, MoonUnderground: 3, MoonOverworld: 4 };
@@ -19,6 +21,8 @@ const BILINEAR_SAMPLING = 2;
 const MAX_BAKE_TRANSPARENCY = 0.25;
 // How often to look for newly loaded objects (new map regions) to bake.
 const BAKE_SCAN_INTERVAL_MS = 1000;
+// How often to check for fences that loaded or unloaded.
+const FENCE_UPDATE_INTERVAL_MS = 500;
 
 function hexToRgb(hex) {
   const value = parseInt(String(hex).replace("#", ""), 16);
@@ -103,6 +107,12 @@ var OsrsWorld = class extends Plugin {
         value: true,
         callback: () => this.settings.osrsTextures.value || this.restoreTextures()
       },
+      osrsFences: {
+        text: "OSRS fences (from your OSRS cache)",
+        type: SettingsTypes.checkbox,
+        value: true,
+        callback: () => this.settings.osrsFences.value || this.removeFences()
+      },
       flatObjects: {
         text: "Flat-coloured objects (when OSRS textures are off)",
         type: SettingsTypes.checkbox,
@@ -144,6 +154,9 @@ var OsrsWorld = class extends Plugin {
     this.restore();
     this.unbakeAll();
     this.restoreTextures();
+    this.removeFences();
+    this.osrsSceneryMaterial?.dispose();
+    this.osrsSceneryMaterial = null;
     this.restoreGroundTexture();
     if (this.groundMesh) this.setGroundSampling(this.groundMesh, BILINEAR_SAMPLING);
     this.groundMesh = null;
@@ -190,6 +203,44 @@ var OsrsWorld = class extends Plugin {
         .finally(() => (this.bakeInProgress = false));
     }
     this.updateAtmosphere(scene);
+    this.updateFences(scene);
+  }
+
+  // OSRS fence objects in place of the game's fence walls (see fences.js).
+  updateFences(scene) {
+    if (!this.settings.osrsFences.value || !window.osrsCache) return;
+    const material = this.sceneryMaterial(scene);
+    if (!material) return;
+    const light = this.atmosphere?.HemisphericLight;
+    if (light) {
+      const level = (channel) => Math.min(1, Math.max(0.45, light.diffuse[channel] * light.intensity * 1.1));
+      material.emissiveColor.set(level("r"), level("g"), level("b"));
+    }
+    if (performance.now() - (this.lastFenceUpdate ?? 0) < FENCE_UPDATE_INTERVAL_MS) return;
+    this.lastFenceUpdate = performance.now();
+    this.fences ??= new OsrsFences(scene, () => this.gameHooks.WorldEntityManager?.Instance?.WorldEntities);
+    this.fences.update(material).catch((error) => this.error("Building OSRS fences failed", error));
+  }
+
+  removeFences() {
+    this.fences?.dispose();
+    this.fences = null;
+  }
+
+  // Unlit material for OSRS scenery: lighting is baked into vertex colours,
+  // and the emissive colour follows the scene's light level (dim in caves).
+  sceneryMaterial(scene) {
+    if (this.osrsSceneryMaterial) return this.osrsSceneryMaterial;
+    const template = scene.materials.find((m) => m.getClassName() === "StandardMaterial");
+    if (!template) return null;
+    const material = new template.constructor("osrsworld-scenery", scene);
+    material.disableLighting = true;
+    material.diffuseColor = new template.diffuseColor.constructor(0, 0, 0);
+    material.specularColor = new template.diffuseColor.constructor(0, 0, 0);
+    material.emissiveColor = new template.diffuseColor.constructor(1, 1, 1);
+    material.backFaceCulling = false;
+    this.osrsSceneryMaterial = material;
+    return material;
   }
 
   // Object materials (walls, roofs, trees, rocks...) with a diffuse texture.
@@ -209,7 +260,7 @@ var OsrsWorld = class extends Plugin {
       for (const material of this.objectMaterials(source)) {
         touched = true;
         if (this.retextured.has(material) || !material.diffuseTexture?.isReady?.()) continue;
-        await this.retexture(material);
+        await this.retexture(material, source);
       }
       if (touched && !this.facetedMeshes.has(source) && !source.isDisposed() && source.getTotalVertices?.() > 0) {
         this.facetedMeshes.add(source);
@@ -219,13 +270,20 @@ var OsrsWorld = class extends Plugin {
     }
   }
 
-  async retexture(material) {
+  async retexture(material, mesh) {
     const original = material.diffuseTexture;
     this.retextured.set(material, original);
-    const { width, height } = original.getSize();
-    const pixels = await original.readPixels();
-    if (!pixels || material.diffuseTexture !== original) return;
-    const canvas = osrsStyleTexture(pixels, width, height);
+    // Textures with an OSRS counterpart use the real one from the player's
+    // OSRS cache; the rest are restyled.
+    const osrsId = OSRS_TEXTURE_FOR.get(this.textureFileOf(material, mesh));
+    let canvas = osrsId === undefined ? null : await osrsTextureCanvas(osrsId);
+    if (material.diffuseTexture !== original) return;
+    if (!canvas) {
+      const { width, height } = original.getSize();
+      const pixels = await original.readPixels();
+      if (!pixels || material.diffuseTexture !== original) return;
+      canvas = osrsStyleTexture(pixels, width, height);
+    }
     const Texture = original.constructor;
     const texture = new Texture(canvas.toDataURL(), material.getScene(), false, original._invertY ?? true, NEAREST_SAMPLING);
     texture.hasAlpha = original.hasAlpha;
@@ -233,6 +291,22 @@ var OsrsWorld = class extends Plugin {
     texture.wrapV = original.wrapV;
     material.unfreeze?.();
     material.diffuseTexture = texture;
+  }
+
+  // The game texture a world object's material was made from ("15.png").
+  // Walls name their materials after their entity ("2903-material"); other
+  // objects name it in their mesh spec ("roof4.obj%15.png%...",
+  // "cube_8_1_8_10_0_14.png_null") or use their model's default.
+  textureFileOf(material, mesh) {
+    const id = /^(\d+)-material$/.exec(material.name)?.[1];
+    const fromEntity = id && this.gameHooks.WorldEntityManager?.Instance?.WorldEntities?.get(Number(id))?._appearance?._materialFileName;
+    if (fromEntity) return fromEntity;
+    const spec = mesh?.metadata?._meshFileName;
+    if (typeof spec !== "string") return null;
+    if (spec.startsWith("cube_")) return /_([^_]+\.png)_/.exec(spec)?.[1] ?? null;
+    const [file, override] = spec.split("%");
+    if (override?.endsWith(".png")) return override;
+    return MODEL_DEFAULT_TEXTURES.get(file)?.[material.name] ?? null;
   }
 
   restoreTextures() {

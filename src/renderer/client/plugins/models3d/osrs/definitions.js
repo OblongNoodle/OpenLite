@@ -7,7 +7,7 @@ import { decodeOldFormat, decodeType1, decodeType2, decodeType3 } from "./modelF
 
 // Cache layout: index numbers, and archives inside the config index.
 export const CacheIndex = { Frames: 0, Framemaps: 1, Configs: 2, Models: 7 };
-export const ConfigArchive = { IdentityKit: 3, Npc: 9, Item: 10, Sequence: 12 };
+export const ConfigArchive = { IdentityKit: 3, Object: 6, Npc: 9, Item: 10, Sequence: 12 };
 
 // NPC definitions: models, name, animations, recolours, scale and lighting.
 // Decoding stops at the first opcode past those (head icons, transforms...).
@@ -44,6 +44,81 @@ export function decodeNpc(id, bytes) {
     else if (opcode === 100) def.ambient = s.readByte();
     else if (opcode === 101) def.contrast = s.readByte();
     else break;
+  }
+  return def;
+}
+
+// Object (loc) definitions: models by shape type, name, size, recolours,
+// model scale/offset and lighting. Other fields are read past.
+export function decodeObject(id, bytes) {
+  const s = new ByteStream(bytes);
+  const def = {
+    id, name: "", models: [], types: null, sizeX: 1, sizeY: 1, recolorToFind: [], recolorToReplace: [],
+    retextureToFind: [], textureToReplace: [], scaleX: 128, scaleY: 128, scaleZ: 128,
+    offsetX: 0, offsetY: 0, offsetZ: 0, ambient: 0, contrast: 0, rotated: false
+  };
+  const readModels = (wide, typed) => {
+    const count = s.readUnsignedByte();
+    if (!count) return;
+    def.models = [];
+    def.types = typed ? [] : null;
+    for (let i = 0; i < count; i++) {
+      def.models.push(wide ? s.readInt() : s.readUnsignedShort());
+      if (typed) def.types.push(s.readUnsignedByte());
+    }
+  };
+  for (let opcode = s.readUnsignedByte(); opcode !== 0; opcode = s.readUnsignedByte()) {
+    if (opcode === 1) readModels(false, true);
+    else if (opcode === 5) readModels(false, false);
+    else if (opcode === 6) readModels(true, true);
+    else if (opcode === 7) readModels(true, false);
+    else if (opcode === 2) def.name = s.readString();
+    else if (opcode === 14) def.sizeX = s.readUnsignedByte();
+    else if (opcode === 15) def.sizeY = s.readUnsignedByte();
+    else if (opcode === 17 || opcode === 18 || opcode === 21 || opcode === 22 || opcode === 23 || opcode === 27 || opcode === 64 || opcode === 73 || opcode === 74 || opcode === 89 || opcode === 90 || opcode === 94) continue;
+    else if (opcode === 19 || opcode === 28 || opcode === 75 || opcode === 81 || opcode === 91 || opcode === 95 || opcode === 96) s.readUnsignedByte();
+    else if (opcode === 24 || opcode === 42 || opcode === 61 || opcode === 68 || opcode === 82) s.readUnsignedShort();
+    else if (opcode === 29) def.ambient = s.readByte();
+    else if (opcode === 39) def.contrast = s.readByte() * 25;
+    else if (opcode >= 30 && opcode < 35) s.readString();
+    else if (opcode === 40 || opcode === 41) {
+      const count = s.readUnsignedByte();
+      const [find, replace] = opcode === 40 ? [def.recolorToFind, def.recolorToReplace] : [def.retextureToFind, def.textureToReplace];
+      for (let i = 0; i < count; i++) {
+        find.push(s.readUnsignedShort());
+        replace.push(s.readUnsignedShort());
+      }
+    } else if (opcode === 62) def.rotated = true;
+    else if (opcode === 65) def.scaleX = s.readUnsignedShort();
+    else if (opcode === 66) def.scaleY = s.readUnsignedShort();
+    else if (opcode === 67) def.scaleZ = s.readUnsignedShort();
+    else if (opcode === 69) s.readByte();
+    else if (opcode === 70) def.offsetX = s.readShort();
+    else if (opcode === 71) def.offsetY = s.readShort();
+    else if (opcode === 72) def.offsetZ = s.readShort();
+    else if (opcode === 77 || opcode === 92) {
+      s.skip(opcode === 92 ? 6 : 4);
+      s.skip((s.readUnsignedByte() + 1) * 2);
+    } else if (opcode === 78) s.skip(4);
+    else if (opcode === 79) {
+      s.skip(6);
+      s.skip(s.readUnsignedByte() * 2);
+    } else if (opcode === 93) s.skip(6);
+    else if (opcode === 100) {
+      s.skip(2);
+      s.readString();
+    } else if (opcode === 101 || opcode === 102) {
+      s.skip(opcode === 102 ? 14 : 13);
+      s.readString();
+    } else if (opcode === 249) {
+      const count = s.readUnsignedByte();
+      for (let i = 0; i < count; i++) {
+        const isString = s.readUnsignedByte() === 1;
+        s.skip(3);
+        if (isString) s.readString();
+        else s.readInt();
+      }
+    } else break;
   }
   return def;
 }
