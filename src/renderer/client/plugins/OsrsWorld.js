@@ -519,6 +519,11 @@ var OsrsWorld = class extends Plugin {
         texture.hasAlpha = original.hasAlpha;
         texture.wrapU = original.wrapU;
         texture.wrapV = original.wrapV;
+        // Shared by materials in every map region, and the game disposes a
+        // region's materials with their textures when it unloads: only
+        // restoreTextures may dispose it.
+        texture.osrsDispose = texture.dispose.bind(texture);
+        texture.dispose = () => {};
         resolve(texture);
       }, () => resolve(null));
     });
@@ -572,7 +577,7 @@ var OsrsWorld = class extends Plugin {
   restoreTextures() {
     for (const [material, original] of this.retextured) material.diffuseTexture = original;
     this.retextured.clear();
-    for (const texture of this.readyTextures.values()) texture.dispose();
+    for (const texture of this.readyTextures.values()) texture.osrsDispose?.();
     this.readyTextures.clear();
     this.textureCache.clear();
   }
