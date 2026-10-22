@@ -9,6 +9,7 @@ import { PALETTE_DISTANCE, colorDistance, shade } from "./sampling.js";
 // Which generator replaces each of the game's object meshes.
 const SCENERY_BY_MESH = [
   [/^normal_tree\d*\.obj$/, "tree"],
+  [/^pinetree\d*\.obj$/, "pineTree"],
   [/^deadtree\d*\.obj$/, "deadTree"],
   [/^treestump\d*\.obj$/, "stump"],
   [/^ore_rock\d*\.obj$/, "oreRock"],
@@ -110,6 +111,7 @@ export async function loadSceneryColors(kind, meshes) {
   const palettes = await Promise.all(meshes.map((mesh) => sampleMeshColors(mesh).catch(() => [])));
   switch (kind) {
     case "tree":
+    case "pineTree":
       return { bark: palettes[1]?.[0] ?? palettes[0]?.[0] ?? DEFAULTS.bark, leaves: palettes[2]?.[0] ?? DEFAULTS.leaves, stumpTop: palettes[0]?.[1] ?? null };
     case "deadTree":
     case "stump":
@@ -138,6 +140,11 @@ function branch(g, bark, x, y, z, length, radius, tiltX, tiltZ) {
 }
 
 const GENERATORS = {
+  // Pines have no generator of their own (OSRS's Arctic pine is used when
+  // OSRS scenery is on); they fall back to the broadleaf tree.
+  pineTree(...args) {
+    GENERATORS.tree(...args);
+  },
   // A thick trunk with a few boughs carrying a crown of rounded leaf clumps.
   tree(g, colors, rand, seed) {
     const bark = colors.bark, leaves = vivid(colors.leaves, 0.3);
@@ -224,7 +231,7 @@ const GENERATORS = {
 // drawn as a stump.
 export function buildScenery(kind, colors, seed, resourceState) {
   const exhausted = resourceState === EXHAUSTED;
-  const generator = (kind === "tree" || kind === "deadTree") && exhausted ? "stump" : kind;
+  const generator = (kind === "tree" || kind === "pineTree" || kind === "deadTree") && exhausted ? "stump" : kind;
   const g = new GeometryBuilder();
   GENERATORS[generator](g, colors, random(seed * 9301 + 49297), seed, exhausted);
   return g;

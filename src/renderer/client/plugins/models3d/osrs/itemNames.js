@@ -4,8 +4,8 @@
 //
 // The game has its own metal and wood tiers; they stand in for OSRS's tiers
 // in the same order (palladium is mithril, coronium adamant, celadon rune;
-// pine logs are willow, palm maple, cherry yew, wizard magic, deadwood
-// redwood).
+// palm logs are maple, cherry yew, wizard magic, deadwood redwood; pine logs
+// are OSRS's Arctic pine logs, and pine bows willow).
 
 // Whole-name aliases, for items OSRS calls something else altogether (or
 // whose name means something else in OSRS).
@@ -92,7 +92,7 @@ const ALIASES = {
   "palladium bar": "mithril bar",
   "coronium ore": "adamantite ore",
   "coronium bar": "adamantite bar",
-  "pine logs": "willow logs",
+  "pine logs": "arctic pine logs",
   "palm logs": "maple logs",
   "cherry logs": "yew logs",
   "wizard logs": "magic logs",

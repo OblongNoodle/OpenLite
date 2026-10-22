@@ -20,16 +20,16 @@ import { ActionState } from "@highlite/core";
 // chopped tree's stump, a mined rock's bare stone). Ore rocks by their ore.
 // Rocks are OSRS boulders, varied between the two; ore rocks wear OSRS's
 // rock texture over their ore colour.
-const OSRS_SCENERY = { tree: 1276, stump: 1341, deadTree: 1286, bush: 1124, rock: [10790, 10791] };
+const OSRS_SCENERY = { tree: 1276, pineTree: 3037, stump: 1341, deadTree: 1286, bush: 1124, rock: [10790, 10791] }; // pine: ARCTIC_PINE
 const ORE_ROCK_TEXTURE = 11;
 // Kinds sized to the original object (the game's trees and boulders are
 // bigger than OSRS's): trees stretched to its width and height, boulders
 // scaled evenly to fill its larger dimension. The rest keep the world's OSRS
 // scale.
-const FIT_TO_ORIGINAL = new Set(["tree", "deadTree", "rock"]);
+const FIT_TO_ORIGINAL = new Set(["tree", "pineTree", "deadTree", "rock"]);
 const FIT_EVENLY = new Set(["rock"]);
 const OSRS_ORE_ROCKS = { copper: 10943, tin: 11360, iron: 11364 };
-const OSRS_USED_UP = { tree: 1341, oreRock: 11390 };
+const OSRS_USED_UP = { tree: 1341, pineTree: 21274, oreRock: 11390 }; // pine: ARCTIC_PINE_TREE_STUMP
 const USED_UP_STATE = 0;
 // OSRS figures are drawn larger to match the game's; scenery is scaled alike.
 const OSRS_WORLD_SCALE = 1.2;
