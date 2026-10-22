@@ -45,6 +45,39 @@ const ICON_SCAN_INTERVAL_MS = 500;
 // Item ids the game uses stay below this.
 const GAME_ITEM_ID_LIMIT = 2000;
 
+// OSRS objects for the game's furniture, by its model file (or its name, for
+// objects built from boxes): RuneLite's gameval names in brackets.
+const OSRS_FURNITURE_BY_MODEL = {
+  "stove1.obj": 7183, // FAI_VARROCK_RANGE
+  "chair1.obj": 1088, // CHAIR
+  "chest1.obj": 2693, // bank chest
+  "counter1.obj": 3029, // FAI_VARROCK_GENERAL_STORE_COUNTER
+  "bookshelf1.obj": 380, // BOOKCASE
+  "gravestone1.obj": 404, // GRAVESTONE1
+  "gravestone2.obj": 405, // GRAVESTONE2
+  "haystack1.obj": 298 // HAYSTACK
+};
+const OSRS_FURNITURE_BY_NAME = { Crate: 354 }; // CRATE2
+// Tables: the plank table for long ones, the small square one otherwise.
+const OSRS_LONG_TABLE = 601; // TABLE2
+const OSRS_SMALL_TABLE = 602; // TABLE
+// How far each OSRS model is turned from the game model it replaces (their
+// fronts differ), by the game's model file.
+const FURNITURE_FACING = { "stove1.obj": Math.PI };
+// How far one axis may stretch (or squeeze) past the height's scale when
+// fitting.
+const FURNITURE_MAX_STRETCH = 1.6;
+
+function osrsFurnitureFacing(entity) {
+  return FURNITURE_FACING[String(entity._appearance?._meshFileName ?? "").split("%")[0]] ?? 0;
+}
+
+function osrsFurnitureObject(entity) {
+  const model = String(entity._appearance?._meshFileName ?? "").split("%")[0];
+  if (model === "table1.obj") return Math.max(entity._width ?? 1, entity._length ?? 1) >= 1.5 ? OSRS_LONG_TABLE : OSRS_SMALL_TABLE;
+  return OSRS_FURNITURE_BY_MODEL[model] ?? OSRS_FURNITURE_BY_NAME[entity._def?._name] ?? null;
+}
+
 // The OSRS object for a piece of scenery; `seed` picks between variants.
 function osrsSceneryObject(kind, name, state, seed) {
   if (state === USED_UP_STATE && OSRS_USED_UP[kind]) return OSRS_USED_UP[kind];
@@ -140,6 +173,7 @@ var Models3D = class extends Plugin {
     this.records.clear();
     this.clearGroundItems();
     this.clearScenery();
+    this.clearFurniture();
     this.restoreItemIcons();
     // Specs are cheap to rebuild and may come from older code after a hot swap.
     this.specCache.clear();
@@ -378,6 +412,7 @@ var Models3D = class extends Plugin {
 
     this.renderGroundItems();
     this.renderScenery();
+    this.renderFurniture();
     this.updateItemIcons();
 
     for (const exhibit of this.gallery ?? []) {
@@ -697,6 +732,88 @@ var Models3D = class extends Plugin {
     record.mesh?.dispose();
     record.mesh = null;
     if (!record.entity.IsDestroyed) for (const mesh of record.appearance.BJSMeshes ?? []) (mesh.sourceMesh ?? mesh).visibility = 1;
+  }
+
+  // Furniture and other indoor objects (stoves, crates, tables, chairs,
+  // counters, bookcases, chests, gravestones, haystacks) are drawn as OSRS
+  // objects: placed where the original stands, turned its way, and fitted to
+  // its size (tables keep the game's height, so items on them still rest on
+  // top). The originals stay, invisible, as click targets.
+  renderFurniture() {
+    const worldEntities = this.gameHooks.WorldEntityManager?.Instance?.WorldEntities;
+    const enabled = this.settings.osrsScenery.value && this.ctors && worldEntities && window.osrsCache;
+    this.furnitureRecords ??= new Map();
+    const seen = new Set();
+    if (enabled) {
+      for (const entity of worldEntities.values()) {
+        const appearance = entity?._appearance;
+        const meshes = appearance?._bjsMeshes;
+        if (!meshes?.length || entity._isDestroyed) continue;
+        const objectId = osrsFurnitureObject(entity);
+        if (objectId === null) continue;
+        seen.add(entity);
+        if (this.furnitureRecords.has(entity)) continue;
+        const record = { entity, meshes, mesh: null };
+        this.furnitureRecords.set(entity, record);
+        this.osrsLocMesh(objectId).then((prototype) => {
+          if (!prototype || this.furnitureRecords?.get(entity) !== record) return;
+          record.mesh = this.placeFurniture(prototype, meshes, appearance, entity.EntityID ?? entity._entityId, osrsFurnitureFacing(entity));
+          // Instances draw with their source mesh's visibility, so hide the
+          // source (every copy of that object gets a replacement anyway).
+          if (record.mesh) for (const mesh of meshes) (mesh.sourceMesh ?? mesh).visibility = 0;
+        }).catch((error) => this.error("Building OSRS furniture failed", error));
+      }
+    }
+    for (const [entity, record] of this.furnitureRecords) {
+      if (seen.has(entity)) continue;
+      this.disposeFurnitureRecord(record);
+      this.furnitureRecords.delete(entity);
+    }
+  }
+
+  // A clone of an OSRS object fitted over the original's meshes.
+  placeFurniture(prototype, meshes, appearance, id, facing = 0) {
+    let min = null, max = null;
+    for (const mesh of meshes) {
+      mesh.computeWorldMatrix(true);
+      const box = mesh.getBoundingInfo().boundingBox;
+      if (Math.abs(box.centerWorld.x) > 2000) continue;
+      min = min ? min.minimizeInPlace(box.minimumWorld) : box.minimumWorld.clone();
+      max = max ? max.maximizeInPlace(box.maximumWorld) : box.maximumWorld.clone();
+    }
+    const size = prototype.metadata?.size;
+    if (!min || !size) return null;
+    const mesh = prototype.clone(`models3d-furniture-${id}`);
+    mesh.setEnabled(true);
+    // The original's facing (chairs stand at any angle), turned by however
+    // far the OSRS model's front is from the game model's. The footprint is
+    // fitted by the nearest quarter turn.
+    const yaw = (appearance._rotation?._y ?? 0) + facing;
+    mesh.rotation.y = yaw;
+    const across = (Math.round(yaw / (Math.PI / 2)) & 1) === 0;
+    const dx = max.x - min.x, dz = max.z - min.z, dy = max.y - min.y;
+    // Fit each axis, but never stretch one more than a third past the height's
+    // scale (chairs and crates keep their shape).
+    const up = dy / Math.max(size.height, 0.01);
+    const fit = (target, length) => Math.min(up * FURNITURE_MAX_STRETCH, Math.max(up / FURNITURE_MAX_STRETCH, target / Math.max(length, 0.01)));
+    mesh.scaling.set(fit(across ? dx : dz, size.width), up, fit(across ? dz : dx, size.depth));
+    // Centre it on the original (OSRS models are not always centred).
+    mesh.position.set(0, 0, 0);
+    mesh.computeWorldMatrix(true);
+    const bounds = mesh.getHierarchyBoundingVectors(true);
+    mesh.position.set((min.x + max.x) / 2 - (bounds.min.x + bounds.max.x) / 2, min.y - bounds.min.y, (min.z + max.z) / 2 - (bounds.min.z + bounds.max.z) / 2);
+    return mesh;
+  }
+
+  disposeFurnitureRecord(record) {
+    record.mesh?.dispose();
+    record.mesh = null;
+    if (!record.entity._isDestroyed) for (const mesh of record.meshes ?? []) (mesh.sourceMesh ?? mesh).visibility = 1;
+  }
+
+  clearFurniture() {
+    for (const record of this.furnitureRecords?.values() ?? []) this.disposeFurnitureRecord(record);
+    this.furnitureRecords?.clear();
   }
 
   clearScenery() {
