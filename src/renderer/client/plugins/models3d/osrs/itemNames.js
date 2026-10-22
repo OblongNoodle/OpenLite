@@ -160,16 +160,16 @@ export function osrsNameCandidates(name, hasRaw = () => false) {
   if (hasRaw(key)) add(`cooked ${key}`);
   let rewritten = key;
   for (const [pattern, replacement] of RULES) rewritten = rewritten.replace(pattern, replacement);
-  // The game's helms are drawn as OSRS full helms (OSRS's plain "helm"
-  // items are unused).
-  const fullHelm = (value) => value.replace(/\b(\w+) helm\b/, (match, word) => (word === "full" || word === "med" ? match : `${word} full helm`));
+  // The game's open helms are OSRS med helms, its full helms OSRS's full
+  // helms (OSRS's plain "helm" items are unused).
+  const medHelm = (value) => value.replace(/\b(\w+) helm\b/, (match, word) => (word === "full" || word === "med" ? match : `${word} med helm`));
   for (const value of [rewritten, key]) {
-    add(fullHelm(value));
+    add(medHelm(value));
     add(value);
     for (const [pattern, replacement] of SUFFIXES) {
       if (!pattern.test(value)) continue;
       const trimmed = value.replace(pattern, replacement);
-      add(fullHelm(trimmed));
+      add(medHelm(trimmed));
       add(trimmed);
     }
     add(value.replace(/s$/, ""));

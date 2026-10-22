@@ -131,6 +131,12 @@ var OsrsWorld = class extends Plugin {
         value: true,
         callback: () => this.settings.hideDecorativePlants.value || this.showDecorativePlants()
       },
+      lockedCamera: {
+        text: "OSRS camera (locked to player)",
+        type: SettingsTypes.checkbox,
+        value: true,
+        callback: () => this.settings.lockedCamera.value || this.restoreCameraFollow()
+      },
       osrsInterface: {
         text: "OSRS interface style",
         type: SettingsTypes.checkbox,
@@ -193,6 +199,7 @@ var OsrsWorld = class extends Plugin {
     this.removeFences();
     this.removeRoofs();
     removeOsrsInterface();
+    this.restoreCameraFollow();
     this.showDecorativePlants();
     this.restoreWater();
     this.osrsSceneryMaterial?.dispose();
@@ -247,6 +254,7 @@ var OsrsWorld = class extends Plugin {
     this.updateAtmosphere(scene);
     this.updateSceneryBrightness();
     this.repairCullingBoxes(scene);
+    if (this.settings.lockedCamera.value) this.lockCameraToPlayer();
     if (this.settings.osrsInterface.value) applyOsrsInterface();
     this.updateFences(scene);
     this.updateWater(scene, scene.getEngine().getDeltaTime());
@@ -485,6 +493,28 @@ var OsrsWorld = class extends Plugin {
   // Static meshes have frozen world matrices; after their geometry changes the
   // matrix must be refrozen, or the bounding box stays at the origin and the
   // mesh is culled as off-screen.
+  // OSRS's camera stays on the player. The game's eases after them (it lags
+  // up to its focus radius behind and glides on after they stop, which reads
+  // as the player slowing down well before arriving); a zero radius and full
+  // centering lock it on, as the game's own Classic camera does. Rotation and
+  // zoom keep the player's settings.
+  lockCameraToPlayer() {
+    const camera = this.gameHooks.GameCameraManager;
+    if (!camera || (camera.FocusRadius === 0 && camera.FocusCenteringRate === 1)) return;
+    this.cameraFollow ??= { radius: camera.FocusRadius, centering: camera.FocusCenteringRate };
+    camera.FocusRadius = 0;
+    camera.FocusCenteringRate = 1;
+  }
+
+  restoreCameraFollow() {
+    const camera = this.gameHooks.GameCameraManager;
+    if (camera && this.cameraFollow) {
+      camera.FocusRadius = this.cameraFollow.radius;
+      camera.FocusCenteringRate = this.cameraFollow.centering;
+    }
+    this.cameraFollow = null;
+  }
+
   // Frozen meshes can be left with culling boxes from before they were
   // placed (still at the origin), so they vanish whenever the origin is off
   // screen (a stove seen again after walking away). Boxes that disagree with
