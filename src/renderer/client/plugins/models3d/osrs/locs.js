@@ -45,7 +45,7 @@ function faceUvs(model, f) {
 
 // Merges decoded models, keeping per-face textures and texture coordinates.
 export function mergeTextured(models) {
-  const merged = { vertexX: [], vertexY: [], vertexZ: [], faceA: [], faceB: [], faceC: [], colors: [], renderTypes: [], textures: [], uvs: [] };
+  const merged = { vertexX: [], vertexY: [], vertexZ: [], faceA: [], faceB: [], faceC: [], colors: [], renderTypes: [], textures: [], uvs: [], alphas: [] };
   for (const model of models) {
     const base = merged.vertexX.length;
     for (let v = 0; v < model.vertexCount; v++) {
@@ -61,6 +61,8 @@ export function mergeTextured(models) {
       merged.renderTypes.push(model.faceRenderTypes ? model.faceRenderTypes[f] & 3 : 0);
       const texture = model.faceTextures ? model.faceTextures[f] : -1;
       merged.textures.push(texture);
+      // Transparency 0 (solid) to 255 (invisible).
+      merged.alphas.push(model.faceTransparencies ? model.faceTransparencies[f] & 255 : 0);
       merged.uvs.push(texture >= 0 ? faceUvs(model, f) : null);
     }
   }

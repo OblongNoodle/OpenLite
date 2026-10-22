@@ -2,7 +2,9 @@
 // (Inv.renderObjectSprite in the 2009 client): the item's inventory model,
 // recoloured and lit, turned and placed by the item's own zoom, angles and
 // offsets, projected into a 36x32 sprite around (16, 16), then given a
-// one-pixel black outline and a dark drop shadow.
+// one-pixel black outline and a dark drop shadow. Icons are drawn at
+// ICON_SCALE times that size (outline and shadow scaled alike), so they stay
+// smooth when shown larger than OSRS shows them.
 import { rsColorToRgb } from "./player.js";
 import { lightness, mergeTextured } from "./locs.js";
 import { osrsTextureCanvas } from "../../osrsworld/osrsTextures.js";
@@ -10,6 +12,8 @@ import { osrsTextureCanvas } from "../../osrsworld/osrsTextures.js";
 const CONFIG_INDEX = 2;
 const ITEM_ARCHIVE = 10;
 const WIDTH = 36, HEIGHT = 32, CENTRE_X = 16, CENTRE_Y = 16;
+const ICON_SCALE = 4;
+const W = WIDTH * ICON_SCALE, H = HEIGHT * ICON_SCALE;
 // The client's 2048-step sine and cosine tables (16.16 fixed point).
 const SINE = Int32Array.from({ length: 2048 }, (_, i) => Math.trunc(Math.sin(i * 0.0030679615) * 65536));
 const COSINE = Int32Array.from({ length: 2048 }, (_, i) => Math.trunc(Math.cos(i * 0.0030679615) * 65536));
@@ -136,9 +140,12 @@ function textureColor(id) {
 
 // Fills a triangle with colours shaded between its corners, where nearer
 // faces drawn later cover it.
-function fillTriangle(pixels, [ax, ay, bx, by, cx, cy], colors) {
-  const minX = Math.max(0, Math.floor(Math.min(ax, bx, cx))), maxX = Math.min(WIDTH - 1, Math.ceil(Math.max(ax, bx, cx)));
-  const minY = Math.max(0, Math.floor(Math.min(ay, by, cy))), maxY = Math.min(HEIGHT - 1, Math.ceil(Math.max(ay, by, cy)));
+// `transparency` is the face's (0 solid to 255 invisible): see-through faces
+// (glass) blend over what is behind them.
+function fillTriangle(pixels, [ax, ay, bx, by, cx, cy], colors, transparency = 0) {
+  const opacity = 1 - transparency / 255;
+  const minX = Math.max(0, Math.floor(Math.min(ax, bx, cx))), maxX = Math.min(W - 1, Math.ceil(Math.max(ax, bx, cx)));
+  const minY = Math.max(0, Math.floor(Math.min(ay, by, cy))), maxY = Math.min(H - 1, Math.ceil(Math.max(ay, by, cy)));
   const area = (bx - ax) * (cy - ay) - (cx - ax) * (by - ay);
   if (Math.abs(area) < 1e-6) return;
   for (let y = minY; y <= maxY; y++) {
@@ -148,9 +155,13 @@ function fillTriangle(pixels, [ax, ay, bx, by, cx, cy], colors) {
       const w1 = ((cx - px) * (ay - py) - (ax - px) * (cy - py)) / area;
       const w2 = 1 - w0 - w1;
       if (w0 < 0 || w1 < 0 || w2 < 0) continue;
-      const o = (y * WIDTH + x) * 4;
-      for (let k = 0; k < 3; k++) pixels[o + k] = Math.round(255 * Math.min(1, colors[0][k] * w0 + colors[1][k] * w1 + colors[2][k] * w2));
-      pixels[o + 3] = 255;
+      const o = (y * W + x) * 4;
+      const behind = pixels[o + 3] / 255;
+      for (let k = 0; k < 3; k++) {
+        const color = 255 * Math.min(1, colors[0][k] * w0 + colors[1][k] * w1 + colors[2][k] * w2);
+        pixels[o + k] = Math.round(color * opacity + pixels[o + k] * (1 - opacity) * behind);
+      }
+      pixels[o + 3] = Math.round(255 * Math.min(1, opacity + behind * (1 - opacity)));
     }
   }
 }
@@ -197,7 +208,7 @@ async function renderIcon(cache, item) {
     t = (y * cosPitch - z * sinPitch) >> 16;
     z = (y * sinPitch + z * cosPitch) >> 16;
     depth.push(z);
-    screen.push(z > 0 ? [CENTRE_X + (x * 512) / z, CENTRE_Y + (t * 512) / z] : null);
+    screen.push(z > 0 ? [(CENTRE_X + (x * 512) / z) * ICON_SCALE, (CENTRE_Y + (t * 512) / z) * ICON_SCALE] : null);
   }
 
   // Far faces first, near faces over them (the client sorts by depth).
@@ -208,7 +219,7 @@ async function renderIcon(cache, item) {
     faces.push({ f, corners, depth: (depth[corners[0]] + depth[corners[1]] + depth[corners[2]]) / 3 });
   }
   faces.sort((a, b) => b.depth - a.depth);
-  const pixels = new Uint8ClampedArray(WIDTH * HEIGHT * 4);
+  const pixels = new Uint8ClampedArray(W * H * 4);
   for (const { f, corners } of faces) {
     let colors;
     if (data.textures[f] >= 0) {
@@ -217,31 +228,41 @@ async function renderIcon(cache, item) {
     } else {
       colors = lit[f].map((l) => rsColorToRgb((data.colors[f] & 0xff80) + Math.min(126, Math.max(2, ((data.colors[f] & 127) * l) >> 7))));
     }
-    fillTriangle(pixels, corners.flatMap((v) => screen[v]), colors);
+    if (data.alphas[f] >= 250) continue;
+    fillTriangle(pixels, corners.flatMap((v) => screen[v]), colors, data.alphas[f]);
   }
 
-  // Outline (any clear pixel beside the item), then the shadow below-right.
+  // Outline (clear pixels within one OSRS pixel of the item), then the
+  // shadow one OSRS pixel below-right of it.
   const solid = (p) => pixels[p * 4 + 3] !== 0;
   const outlined = new Uint8ClampedArray(pixels);
-  for (let y = 0; y < HEIGHT; y++) {
-    for (let x = 0; x < WIDTH; x++) {
-      const p = y * WIDTH + x;
+  const reach = ICON_SCALE;
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const p = y * W + x;
       if (solid(p)) continue;
-      if ((x > 0 && solid(p - 1)) || (y > 0 && solid(p - WIDTH)) || (x < WIDTH - 1 && solid(p + 1)) || (y < HEIGHT - 1 && solid(p + WIDTH))) {
-        outlined.set([...OUTLINE, 255], p * 4);
+      let near = false;
+      for (let dy = -reach; dy <= reach && !near; dy++) {
+        for (let dx = -reach; dx <= reach && !near; dx++) {
+          if (Math.abs(dx) + Math.abs(dy) > reach) continue;
+          const nx = x + dx, ny = y + dy;
+          near = nx >= 0 && ny >= 0 && nx < W && ny < H && solid(ny * W + nx);
+        }
       }
+      if (near) outlined.set([...OUTLINE, 255], p * 4);
     }
   }
-  for (let y = HEIGHT - 1; y > 0; y--) {
-    for (let x = WIDTH - 1; x > 0; x--) {
-      const p = y * WIDTH + x;
-      if (outlined[p * 4 + 3] === 0 && outlined[(p - WIDTH - 1) * 4 + 3] !== 0) outlined.set([...SHADOW, 255], p * 4);
+  const shadowed = new Uint8ClampedArray(outlined);
+  for (let y = reach; y < H; y++) {
+    for (let x = reach; x < W; x++) {
+      const p = y * W + x;
+      if (outlined[p * 4 + 3] === 0 && outlined[(p - reach * W - reach) * 4 + 3] !== 0) shadowed.set([...SHADOW, 255], p * 4);
     }
   }
   const canvas = document.createElement("canvas");
-  canvas.width = WIDTH;
-  canvas.height = HEIGHT;
-  canvas.getContext("2d").putImageData(new ImageData(outlined, WIDTH, HEIGHT), 0, 0);
+  canvas.width = W;
+  canvas.height = H;
+  canvas.getContext("2d").putImageData(new ImageData(shadowed, W, H), 0, 0);
   return canvas.toDataURL();
 }
 
@@ -257,4 +278,30 @@ export async function osrsItemIcon(cache, name) {
     }).catch(() => null));
   }
   return icons.get(key);
+}
+
+// An OSRS item's inventory model, built for drawing in the world (as the
+// client does for items on the ground): recoloured, retextured, resized and
+// lit, in the form createLocMeshes takes. Null if OSRS has no such item.
+export async function osrsItemModel(cache, name) {
+  const item = (await itemIndex()).get(name.toLowerCase());
+  const model = item && (await cache.model(item.model));
+  if (!model) return null;
+  const data = mergeTextured([model]);
+  item.recolorFind.forEach((color, i) => {
+    for (let f = 0; f < data.colors.length; f++) if (data.colors[f] === color) data.colors[f] = item.recolorReplace[i];
+  });
+  item.retextureFind.forEach((texture, i) => {
+    for (let f = 0; f < data.textures.length; f++) if (data.textures[f] === texture) data.textures[f] = item.retextureReplace[i];
+  });
+  data.vertexX = data.vertexX.map((x) => (x * item.resizeX) >> 7);
+  data.vertexY = data.vertexY.map((y) => (y * item.resizeY) >> 7);
+  data.vertexZ = data.vertexZ.map((z) => (z * item.resizeZ) >> 7);
+  data.lightness = lightness(data, 64 + item.ambient, 768 + item.contrast);
+  return data;
+}
+
+// The OSRS item of this name (lower case), or null.
+export async function findOsrsItem(name) {
+  return (await itemIndex()).get(name.toLowerCase()) ?? null;
 }

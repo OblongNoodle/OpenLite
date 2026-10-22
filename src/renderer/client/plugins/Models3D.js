@@ -12,7 +12,8 @@ import { ITEM_SIZE, itemYaw, loadItemGeometry } from "./models3d/items.js";
 import { buildScenery, loadSceneryColors, sceneryKindFor } from "./models3d/scenery.js";
 import { OsrsCache, OsrsPlayerModel, buildNpcData, buildPlayerData, findNpc } from "./models3d/osrs/player.js";
 import { buildLoc, createLocMeshes, osrsTextureCanvas } from "./models3d/osrs/locs.js";
-import { osrsItemIcon } from "./models3d/osrs/itemIcons.js";
+import { findOsrsItem, osrsItemIcon, osrsItemModel } from "./models3d/osrs/itemIcons.js";
+import { osrsNameCandidates } from "./models3d/osrs/itemNames.js";
 import { ActionState } from "@highlite/core";
 
 // OSRS objects drawn for the game's scenery, by kind, and once used up (a
@@ -41,25 +42,8 @@ const LOADOUT_BOOTS = 8;
 // How often item tables are checked for items to give OSRS icons.
 const ICON_SCAN_INTERVAL_MS = 500;
 
-// The game's item names that differ from OSRS's: [pattern, replacement].
-const OSRS_ITEM_NAMES = [
-  [/\bhatchet\b/, "axe"],
-  [/\bpick\b(?!axe)/, "pickaxe"]
-];
-
-// Game items whose OSRS counterpart has a different name altogether.
-const OSRS_ITEM_ALIASES = {
-  "basic rod": "fishing rod",
-  "black leather gloves": "leather gloves"
-};
-
-// Gear with names as OSRS knows them, for finding OSRS item models.
-function osrsGear(gear) {
-  return Object.fromEntries(Object.entries(gear ?? {}).map(([slot, item]) => {
-    const name = OSRS_ITEM_NAMES.reduce((value, [pattern, replacement]) => value.replace(pattern, replacement), String(item?.name ?? "").toLowerCase());
-    return [slot, item ? { ...item, name } : item];
-  }));
-}
+// Item ids the game uses stay below this.
+const GAME_ITEM_ID_LIMIT = 2000;
 
 // The OSRS object for a piece of scenery; `seed` picks between variants.
 function osrsSceneryObject(kind, name, state, seed) {
@@ -159,12 +143,16 @@ var Models3D = class extends Plugin {
     this.restoreItemIcons();
     // Specs are cheap to rebuild and may come from older code after a hot swap.
     this.specCache.clear();
+    this.osrsItemNames = null;
+    this.gameItemNameSet = null;
     for (const key of ["material", "translucentMaterial", "osrsMaterial"]) {
       this[key]?.dispose();
       this[key] = null;
     }
     for (const prototype of this.locPrototypes?.values() ?? []) prototype.then((mesh) => mesh?.dispose(false, true)).catch(() => {});
     this.locPrototypes = null;
+    for (const prototype of this.itemPrototypes?.values() ?? []) prototype.then((mesh) => mesh?.dispose(false, true)).catch(() => {});
+    this.itemPrototypes = null;
     for (const material of this.locMaterials?.values() ?? []) material.then((m) => m?.dispose(true, true)).catch(() => {});
     this.locMaterials = null;
     this.readyLocMaterials = null;
@@ -414,12 +402,25 @@ var Models3D = class extends Plugin {
         if (!record) {
           record = { item, appearance, instance: null };
           this.itemRecords.set(item, record);
-          this.getItemSource(info, appearance._currentSpriteIndex).then((source) => {
-            if (!source || this.itemRecords.get(item) !== record) return;
-            record.instance = source.createInstance(`models3d-item-${item.EntityID}`);
-            record.instance.isPickable = false;
-            record.instance.rotation.y = itemYaw(item.EntityID);
-            record.instance.scaling.set(ITEM_SIZE, ITEM_SIZE, ITEM_SIZE);
+          // The OSRS item's own model when there is one (as OSRS draws items
+          // on the ground); otherwise the game's sprite, extruded.
+          this.osrsGroundItemMesh(item._name ?? "").then((prototype) => {
+            if (this.itemRecords.get(item) !== record) return;
+            if (prototype) {
+              record.instance = prototype.clone(`models3d-item-${item.EntityID}`);
+              record.instance.setEnabled(true);
+              record.instance.scaling.setAll(OSRS_WORLD_SCALE);
+              record.instance.rotation.y = itemYaw(item.EntityID);
+              record.osrs = true;
+              return;
+            }
+            return this.getItemSource(info, appearance._currentSpriteIndex).then((source) => {
+              if (!source || this.itemRecords.get(item) !== record) return;
+              record.instance = source.createInstance(`models3d-item-${item.EntityID}`);
+              record.instance.isPickable = false;
+              record.instance.rotation.y = itemYaw(item.EntityID);
+              record.instance.scaling.set(ITEM_SIZE, ITEM_SIZE, ITEM_SIZE);
+            });
           });
         }
         if (!record.instance) continue;
@@ -434,6 +435,26 @@ var Models3D = class extends Plugin {
       this.disposeItemRecord(record);
       this.itemRecords.delete(item);
     }
+  }
+
+  // A hidden prototype of an OSRS item's model for items on the ground (see
+  // osrsItemModel), or null; each ground item is a clone.
+  osrsGroundItemMesh(name) {
+    if (!this.settings.osrsCharacters.value || !window.osrsCache) return Promise.resolve(null);
+    this.itemPrototypes ??= new Map();
+    const key = name.toLowerCase();
+    if (!this.itemPrototypes.has(key)) {
+      this.itemPrototypes.set(key, (async () => {
+        const cache = await OsrsCache.open();
+        const osrsName = await this.osrsItemNameFor(key);
+        const data = osrsName && (await osrsItemModel(cache, osrsName));
+        if (!data || !this.itemPrototypes) return null;
+        const root = await createLocMeshes(this.ctors.Mesh, this.scene, data, this.getOsrsMaterial(), (id) => this.locTextureMaterial(id), `models3d-itemmodel-${key}`);
+        root.setEnabled(false);
+        return root;
+      })().catch(() => null));
+    }
+    return this.itemPrototypes.get(key);
   }
 
   // Trees, rocks and bushes are replaced by generated models stretched over
@@ -600,7 +621,7 @@ var Models3D = class extends Plugin {
       this.osrsIconFor(name).then((url) => {
         if (!url || items[slot]?._def?._name !== name || !this.settings.osrsIcons.value) return;
         if (image.dataset.osrsIcon === undefined) image.dataset.originalStyle = image.style.cssText;
-        Object.assign(image.style, { backgroundImage: `url(${url})`, backgroundPosition: "center", backgroundSize: "contain", backgroundRepeat: "no-repeat", imageRendering: "pixelated" });
+        Object.assign(image.style, { backgroundImage: `url(${url})`, backgroundPosition: "center", backgroundSize: "contain", backgroundRepeat: "no-repeat", imageRendering: "auto" });
         image.dataset.osrsIcon = name;
       });
     }
@@ -608,15 +629,53 @@ var Models3D = class extends Plugin {
 
   // The OSRS icon for a game item name: its own name, then as OSRS names it.
   async osrsIconFor(name) {
-    const cache = await OsrsCache.open();
-    const osrsName = osrsGear({ 0: { name } })[0].name;
-    const alias = OSRS_ITEM_ALIASES[osrsName];
-    const candidates = [name, osrsName, osrsName.replace(/\bhelm\b/, "med helm"), osrsName.replace(/s$/, ""), alias].filter(Boolean);
-    for (const candidate of candidates) {
-      const url = await osrsItemIcon(cache, candidate);
-      if (url) return url;
+    const osrsName = await this.osrsItemNameFor(name);
+    return osrsName ? osrsItemIcon(await OsrsCache.open(), osrsName) : null;
+  }
+
+  // The OSRS item that stands for a game item, by name (or null): the first
+  // of its OSRS name candidates (see models3d/osrs/itemNames.js) that exists.
+  osrsItemNameFor(name) {
+    this.osrsItemNames ??= new Map();
+    const key = name.toLowerCase();
+    if (!this.osrsItemNames.has(key)) {
+      this.osrsItemNames.set(key, (async () => {
+        const names = this.gameItemNames();
+        for (const candidate of osrsNameCandidates(key, (name) => names.has(`raw ${name}`))) {
+          if (await findOsrsItem(candidate)) return candidate;
+        }
+        return null;
+      })().catch(() => null));
     }
-    return null;
+    return this.osrsItemNames.get(key);
+  }
+
+  // Gear with the OSRS names of its items, for finding their worn models.
+  async osrsGear(gear) {
+    const entries = await Promise.all(Object.entries(gear ?? {}).map(async ([slot, item]) => {
+      const name = item?.name && (await this.osrsItemNameFor(item.name));
+      return [slot, item ? { ...item, name: name ?? item.name } : item];
+    }));
+    return Object.fromEntries(entries);
+  }
+
+  // Every game item name (lower case), for spotting raw/cooked pairs.
+  gameItemNames() {
+    if (!this.gameItemNameSet) {
+      const names = new Set();
+      const definitions = this.gameHooks.ItemDefinitionManager;
+      for (let id = 0; id < GAME_ITEM_ID_LIMIT; id++) {
+        let def = null;
+        try {
+          def = definitions.getDefById(id);
+        } catch {
+          // Unused ids throw.
+        }
+        if (def?._name && def._name !== "unknown item") names.add(def._name.toLowerCase());
+      }
+      this.gameItemNameSet = names;
+    }
+    return this.gameItemNameSet;
   }
 
   restoreItemIcon(image) {
@@ -762,7 +821,7 @@ var Models3D = class extends Plugin {
       const npc = isPlayer ? null : findNpc(cache, record.entity.Name);
       let data = null;
       if (npc) data = await buildNpcData(cache, npc);
-      else if (record.type.kind === "human" && record.spec) data = await buildPlayerData(cache, record.spec.appearanceIds, record.spec.colors, osrsGear(record.spec.gear));
+      else if (record.type.kind === "human" && record.spec) data = await buildPlayerData(cache, record.spec.appearanceIds, record.spec.colors, await this.osrsGear(record.spec.gear));
       if (!data) return;
       if (record.specKey !== key || this.records.get(record.entity) !== record) return;
       const previousYaw = record.model?.yaw ?? null;

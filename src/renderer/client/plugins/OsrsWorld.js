@@ -11,6 +11,7 @@ import { osrsStyleTexture } from "./osrsworld/textures.js";
 import { MODEL_DEFAULT_TEXTURES, osrsTextureCanvas, osrsTextureForFile } from "./osrsworld/osrsTextures.js";
 import { OsrsFences } from "./osrsworld/fences.js";
 import { OsrsRoofs } from "./osrsworld/roofs.js";
+import { applyOsrsInterface, removeOsrsInterface } from "./osrsworld/osrsInterface.js";
 
 // Map levels in the client.
 const MapLevel = { EarthUnderground: 0, EarthOverworld: 1, EarthSky: 2, MoonUnderground: 3, MoonOverworld: 4 };
@@ -24,6 +25,8 @@ const MAX_BAKE_TRANSPARENCY = 0.25;
 const BAKE_SCAN_INTERVAL_MS = 1000;
 // How often to check for fences that loaded or unloaded.
 const FENCE_UPDATE_INTERVAL_MS = 500;
+// How often frozen meshes' culling boxes are checked (see repairCullingBoxes).
+const CULLING_REPAIR_INTERVAL_MS = 1000;
 // Names ending in "-halo" are skipped by the game's click picking.
 const OSRS_GROUND_NAME = "osrsworld-ground-halo";
 const OSRS_PAVING_NAME = "osrsworld-paving-halo";
@@ -128,6 +131,12 @@ var OsrsWorld = class extends Plugin {
         value: true,
         callback: () => this.settings.hideDecorativePlants.value || this.showDecorativePlants()
       },
+      osrsInterface: {
+        text: "OSRS interface style",
+        type: SettingsTypes.checkbox,
+        value: true,
+        callback: () => (this.settings.osrsInterface.value ? applyOsrsInterface() : removeOsrsInterface())
+      },
       osrsRoofs: {
         text: "OSRS pitched roofs",
         type: SettingsTypes.checkbox,
@@ -183,6 +192,7 @@ var OsrsWorld = class extends Plugin {
     this.restoreTextures();
     this.removeFences();
     this.removeRoofs();
+    removeOsrsInterface();
     this.showDecorativePlants();
     this.restoreWater();
     this.osrsSceneryMaterial?.dispose();
@@ -236,6 +246,8 @@ var OsrsWorld = class extends Plugin {
     }
     this.updateAtmosphere(scene);
     this.updateSceneryBrightness();
+    this.repairCullingBoxes(scene);
+    if (this.settings.osrsInterface.value) applyOsrsInterface();
     this.updateFences(scene);
     this.updateWater(scene, scene.getEngine().getDeltaTime());
   }
@@ -473,6 +485,23 @@ var OsrsWorld = class extends Plugin {
   // Static meshes have frozen world matrices; after their geometry changes the
   // matrix must be refrozen, or the bounding box stays at the origin and the
   // mesh is culled as off-screen.
+  // Frozen meshes can be left with culling boxes from before they were
+  // placed (still at the origin), so they vanish whenever the origin is off
+  // screen (a stove seen again after walking away). Boxes that disagree with
+  // their mesh's place are refreshed.
+  repairCullingBoxes(scene) {
+    if (performance.now() - (this.lastCullingRepair ?? 0) < CULLING_REPAIR_INTERVAL_MS) return;
+    this.lastCullingRepair = performance.now();
+    const Vector3 = scene.activeCamera?.position?.constructor;
+    if (!Vector3) return;
+    for (const mesh of scene.meshes) {
+      if (!mesh.isWorldMatrixFrozen || mesh.getClassName() === "InstancedMesh" || !mesh.getTotalVertices?.()) continue;
+      const box = mesh.getBoundingInfo().boundingBox;
+      const expected = Vector3.TransformCoordinates(box.center, mesh.getWorldMatrix());
+      if (Vector3.Distance(expected, box.centerWorld) > 0.01) this.refreezeWorldMatrix(mesh);
+    }
+  }
+
   refreezeWorldMatrix(mesh) {
     if (!mesh.isWorldMatrixFrozen) return;
     mesh.unfreezeWorldMatrix();
