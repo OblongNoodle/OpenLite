@@ -305,17 +305,6 @@
   resolved "https://registry.npmjs.org/@gar/promisify/-/promisify-1.1.3.tgz"
   integrity sha512-k2Ty1JcVojjJFwrg/ThKi2ujJ7XNLYaFGNB/bWT9wGR+oSMJHMa5w+CUq6p/pVrKeNNgA7pCqEcjSnHVoqJQFw==
 
-"@highlite/core@^2.2.0":
-  version "2.3.0"
-  resolved "https://registry.npmjs.org/@highlite/core/-/core-2.3.0.tgz"
-  integrity sha512-5DDdldBmUsOlp0rfxyXlIDgST/tK1QEijz94a0+yD0BaUIL6dFtHGS02aIZlJBomA+1HaJEkQQZkw3GQREi3sg==
-  dependencies:
-    acorn "^8.15.0"
-    acorn-walk "^8.3.4"
-    idb "^8.0.3"
-    on-change "^5.0.1"
-    tsc "^2.0.4"
-
 "@iconify/iconify@^3.1.1":
   version "3.1.1"
   resolved "https://registry.npmjs.org/@iconify/iconify/-/iconify-3.1.1.tgz"
@@ -411,6 +400,18 @@
   version "4.50.2"
   resolved "https://registry.npmjs.org/@rollup/rollup-win32-x64-msvc/-/rollup-win32-x64-msvc-4.50.2.tgz"
   integrity sha512-APwKy6YUhvZaEoHyM+9xqmTpviEI+9eL7LoCH+aLcvWYHJ663qG5zx7WzWZY+a9qkg5JtzcMyJ9z0WtQBMDmgA==
+
+"@ryelite/core@0.1.2":
+  version "0.1.2"
+  resolved "https://registry.npmjs.org/@ryelite/core/-/core-0.1.2.tgz"
+  integrity sha512-fro4ecRTwg8vkBPHdX0jLDPXg0iYnsIfaGXO4O4qxc+EgkTuIFVlEZdKHlLw8pq04A0+QTSdBotxSkqdkdO2Nw==
+  dependencies:
+    acorn "^8.15.0"
+    acorn-walk "^8.3.4"
+    corepack "^0.34.5"
+    idb "^8.0.3"
+    on-change "^5.0.1"
+    tsc "^2.0.4"
 
 "@sindresorhus/is@^4.0.0":
   version "4.6.0"
@@ -512,16 +513,16 @@ abbrev@^1.0.0:
   integrity sha512-nne9/IiQ/hzIhY6pdDnbBtz7DjPTKrY00P/zvPSm5pOFkl6xuGrGnXn/VtTNNfNtAfZ9/1RtehkszU9qcTii0Q==
 
 acorn-walk@^8.3.4:
-  version "8.3.4"
-  resolved "https://registry.npmjs.org/acorn-walk/-/acorn-walk-8.3.4.tgz"
-  integrity sha512-ueEepnujpqee2o5aIYnvHU6C0A42MNdsIDeqy5BydrkuC5R1ZuUFnm27EeFJGoEHJQgn3uleRvmTXaJgfXbt4g==
+  version "8.3.5"
+  resolved "https://registry.npmjs.org/acorn-walk/-/acorn-walk-8.3.5.tgz"
+  integrity sha512-HEHNfbars9v4pgpW6SO1KSPkfoS0xVOM/9UzkJltjlsHZmJasxg8aXkuZa7SMf8vKGIBhpUsPluQSqhJFCqebw==
   dependencies:
     acorn "^8.11.0"
 
 acorn@^8.11.0, acorn@^8.15.0:
-  version "8.15.0"
-  resolved "https://registry.npmjs.org/acorn/-/acorn-8.15.0.tgz"
-  integrity sha512-NZyJarBfL7nWwIq+FDL6Zp/yHEhePMNnnJ0y3qfieCrmNvYct8uvtiV41UvlSe6apAfk0fY1FbWx+NwfmpvtTg==
+  version "8.19.0"
+  resolved "https://registry.npmjs.org/acorn/-/acorn-8.19.0.tgz"
+  integrity sha512-oJlA3XiRm7Cyk6qFD2Jn8ak9B7jSy0qy00ADO3+8dpT0LSjFihQYv4C02LFCSYJV3Q37xYwwRy5m+IpIiUzqWw==
 
 agent-base@^6.0.2:
   version "6.0.2"
@@ -935,6 +936,11 @@ convert-source-map@^2.0.0:
   version "2.0.0"
   resolved "https://registry.npmjs.org/convert-source-map/-/convert-source-map-2.0.0.tgz"
   integrity sha512-Kvp459HrV2FEJ1CAsi1Ku+MY3kasH19TFykTz2xWmMeq6bk2NU3XXvfJ+Q61m0xktWwt+1HSYf3JZsTms3aRJg==
+
+corepack@^0.34.5:
+  version "0.34.7"
+  resolved "https://registry.npmjs.org/corepack/-/corepack-0.34.7.tgz"
+  integrity sha512-d5OLuTNh4zeJK8+u+G10KScqrnHKNNm6NvR4XO28FZyBFMGE60SNCrBetJLyKR9H1xGCG6U2LyswsyPNdO6kxw==
 
 cross-dirname@^0.1.0:
   version "0.1.0"

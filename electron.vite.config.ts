@@ -15,7 +15,10 @@ export default defineConfig(({ mode }) => {
       plugins: [],
       resolve: {
         alias: {
-          "@static": resolve(__dirname, "static")
+          "@static": resolve(__dirname, "static"),
+          // HighLite's core continues as RyeLite's (same API, working Plugin
+          // Hub); the bundled plugins still import it by its old name.
+          "@highlite/core": "@ryelite/core"
         }
       },
       ...(isDev && {
@@ -30,21 +33,21 @@ export default defineConfig(({ mode }) => {
           },
           proxy: {
             '/socket.io': {
-              target: 'https://server1.highspell.com:8888',
+              target: 'https://server1.openspell.dev',
               changeOrigin: true,
               secure: true,
               headers: {
-                'Origin': 'https://highspell.com',
-                'Referer': 'https://highspell.com/'
+                'Origin': 'https://openspell.dev',
+                'Referer': 'https://openspell.dev/'
               }
             },
             '/api': {
-              target: 'https://highspell.com',
+              target: 'https://api.openspell.dev',
               changeOrigin: true,
               secure: true,
               headers: {
-                'Origin': 'https://highspell.com',
-                'Referer': 'https://highspell.com/'
+                'Origin': 'https://openspell.dev',
+                'Referer': 'https://openspell.dev/'
               }
             }
           }
