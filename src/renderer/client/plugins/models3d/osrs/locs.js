@@ -44,7 +44,7 @@ function faceUvs(model, f) {
 }
 
 // Merges decoded models, keeping per-face textures and texture coordinates.
-function mergeTextured(models) {
+export function mergeTextured(models) {
   const merged = { vertexX: [], vertexY: [], vertexZ: [], faceA: [], faceB: [], faceC: [], colors: [], renderTypes: [], textures: [], uvs: [] };
   for (const model of models) {
     const base = merged.vertexX.length;
@@ -69,7 +69,7 @@ function mergeTextured(models) {
 
 // Lightness (the client's 2-126) at each face corner, as Model.light works it
 // out: smooth faces from vertex normals, flat faces from their own.
-function lightness(model, ambient, contrast) {
+export function lightness(model, ambient, contrast) {
   const vertexCount = model.vertexX.length, faceCount = model.faceA.length;
   const nx = new Float64Array(vertexCount), ny = new Float64Array(vertexCount), nz = new Float64Array(vertexCount), count = new Int32Array(vertexCount);
   const faceNormals = [];

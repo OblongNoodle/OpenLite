@@ -12,6 +12,7 @@ import { ITEM_SIZE, itemYaw, loadItemGeometry } from "./models3d/items.js";
 import { buildScenery, loadSceneryColors, sceneryKindFor } from "./models3d/scenery.js";
 import { OsrsCache, OsrsPlayerModel, buildNpcData, buildPlayerData, findNpc } from "./models3d/osrs/player.js";
 import { buildLoc, createLocMeshes, osrsTextureCanvas } from "./models3d/osrs/locs.js";
+import { osrsItemIcon } from "./models3d/osrs/itemIcons.js";
 import { ActionState } from "@highlite/core";
 
 // OSRS objects drawn for the game's scenery, by kind, and once used up (a
@@ -32,6 +33,27 @@ const USED_UP_STATE = 0;
 // OSRS figures are drawn larger to match the game's; scenery is scaled alike.
 const OSRS_WORLD_SCALE = 1.2;
 const NEAREST_SAMPLING = 1;
+// The equipment window's cells, in page order, as equipment slots (neck,
+// weapon, gloves; helmet, chest, legs, boots; back, shield, ammo). Boots may
+// be left out.
+const LOADOUT_CELL_SLOTS = [6, 4, 7, 0, 1, 2, 8, 5, 3, 9];
+const LOADOUT_BOOTS = 8;
+// How often item tables are checked for items to give OSRS icons.
+const ICON_SCAN_INTERVAL_MS = 500;
+
+// The game's item names that differ from OSRS's: [pattern, replacement].
+const OSRS_ITEM_NAMES = [
+  [/\bhatchet\b/, "axe"],
+  [/\bpick\b(?!axe)/, "pickaxe"]
+];
+
+// Gear with names as OSRS knows them, for finding OSRS item models.
+function osrsGear(gear) {
+  return Object.fromEntries(Object.entries(gear ?? {}).map(([slot, item]) => {
+    const name = OSRS_ITEM_NAMES.reduce((value, [pattern, replacement]) => value.replace(pattern, replacement), String(item?.name ?? "").toLowerCase());
+    return [slot, item ? { ...item, name } : item];
+  }));
+}
 
 // The OSRS object for a piece of scenery; `seed` picks between variants.
 function osrsSceneryObject(kind, name, state, seed) {
@@ -108,6 +130,7 @@ var Models3D = class extends Plugin {
     this.sceneryRecords ??= new Map();
     this.settings.scenery ??= { text: "3D trees, rocks and bushes", type: SettingsTypes.checkbox, value: true, callback: () => {} };
     this.settings.osrsCharacters ??= { text: "OSRS character models (needs RuneLite's OSRS cache)", type: SettingsTypes.checkbox, value: true, callback: () => {} };
+    this.settings.osrsIcons ??= { text: "OSRS item icons (from your OSRS cache)", type: SettingsTypes.checkbox, value: true, callback: () => this.settings.osrsIcons.value || this.restoreItemIcons() };
     this.settings.osrsScenery ??= { text: "OSRS trees and rocks (from your OSRS cache)", type: SettingsTypes.checkbox, value: true, callback: () => this.clearScenery() };
     // Players are built from the local OSRS cache when it is available.
     this.osrsCache = OsrsCache.open().catch((error) => {
@@ -127,6 +150,7 @@ var Models3D = class extends Plugin {
     this.records.clear();
     this.clearGroundItems();
     this.clearScenery();
+    this.restoreItemIcons();
     // Specs are cheap to rebuild and may come from older code after a hot swap.
     this.specCache.clear();
     for (const key of ["material", "translucentMaterial", "osrsMaterial"]) {
@@ -356,6 +380,7 @@ var Models3D = class extends Plugin {
 
     this.renderGroundItems();
     this.renderScenery();
+    this.updateItemIcons();
 
     for (const exhibit of this.gallery ?? []) {
       const pose = { ...this.galleryPose, strike: null };
@@ -536,6 +561,65 @@ var Models3D = class extends Plugin {
     return this.locMaterials.get(textureId);
   }
 
+  // OSRS icons in the game's item tables (inventory, equipment): each slot's
+  // image shows the OSRS item's icon (see models3d/osrs/itemIcons.js) in
+  // place of the game's sprite.
+  updateItemIcons() {
+    if (!this.settings.osrsIcons.value || !window.osrsCache) return;
+    if (performance.now() - (this.lastIconScan ?? 0) < ICON_SCAN_INTERVAL_MS) return;
+    this.lastIconScan = performance.now();
+    const player = this.gameHooks.EntityManager?.Instance?.MainPlayer;
+    // Item tables (the inventory) number their cells; the equipment window
+    // lays its cells out in columns (LOADOUT_CELL_SLOTS).
+    const cells = [];
+    for (const table of document.querySelectorAll(".hs-item-table--inventory")) {
+      for (const cell of table.querySelectorAll("[data-slot]")) cells.push([cell, player?._inventory?._items, Number(cell.dataset.slot)]);
+    }
+    for (const menu of document.querySelectorAll(".hs-loadout-menu")) {
+      const loadoutCells = [...menu.querySelectorAll(".hs-loadout-menu__item-cell")];
+      const slots = loadoutCells.length === LOADOUT_CELL_SLOTS.length ? LOADOUT_CELL_SLOTS : LOADOUT_CELL_SLOTS.filter((slot) => slot !== LOADOUT_BOOTS);
+      loadoutCells.forEach((cell, i) => cells.push([cell, player?._loadout?._items, slots[i]]));
+    }
+    for (const [cell, items, slot] of cells) {
+      const image = cell.querySelector("[class$='__image']");
+      if (!items || !image) continue;
+      const name = items[slot]?._def?._name;
+      if (!name) {
+        this.restoreItemIcon(image);
+        continue;
+      }
+      if (image.dataset.osrsIcon === name) continue;
+      this.osrsIconFor(name).then((url) => {
+        if (!url || items[slot]?._def?._name !== name || !this.settings.osrsIcons.value) return;
+        if (image.dataset.osrsIcon === undefined) image.dataset.originalStyle = image.style.cssText;
+        Object.assign(image.style, { backgroundImage: `url(${url})`, backgroundPosition: "center", backgroundSize: "contain", backgroundRepeat: "no-repeat", imageRendering: "pixelated" });
+        image.dataset.osrsIcon = name;
+      });
+    }
+  }
+
+  // The OSRS icon for a game item name: its own name, then as OSRS names it.
+  async osrsIconFor(name) {
+    const cache = await OsrsCache.open();
+    const osrsName = osrsGear({ 0: { name } })[0].name;
+    for (const candidate of [name, osrsName, osrsName.replace(/\bhelm\b/, "med helm")]) {
+      const url = await osrsItemIcon(cache, candidate);
+      if (url) return url;
+    }
+    return null;
+  }
+
+  restoreItemIcon(image) {
+    if (image.dataset.osrsIcon === undefined) return;
+    image.style.cssText = image.dataset.originalStyle ?? "";
+    delete image.dataset.osrsIcon;
+    delete image.dataset.originalStyle;
+  }
+
+  restoreItemIcons() {
+    for (const image of document.querySelectorAll("[data-osrs-icon]")) this.restoreItemIcon(image);
+  }
+
   disposeSceneryRecord(record) {
     record.mesh?.dispose();
     record.mesh = null;
@@ -668,7 +752,7 @@ var Models3D = class extends Plugin {
       const npc = isPlayer ? null : findNpc(cache, record.entity.Name);
       let data = null;
       if (npc) data = await buildNpcData(cache, npc);
-      else if (record.type.kind === "human" && record.spec) data = await buildPlayerData(cache, record.spec.appearanceIds, record.spec.colors, record.spec.gear);
+      else if (record.type.kind === "human" && record.spec) data = await buildPlayerData(cache, record.spec.appearanceIds, record.spec.colors, osrsGear(record.spec.gear));
       if (!data) return;
       if (record.specKey !== key || this.records.get(record.entity) !== record) return;
       const previousYaw = record.model?.yaw ?? null;
