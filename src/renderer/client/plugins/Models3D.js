@@ -337,10 +337,14 @@ var Models3D = class extends Plugin {
         hitAt: record.hitAt
       };
 
+      // The game nudges a sprite toward its target to show an attack; 3D
+      // models play an attack animation instead, so they stay on their tile.
+      const tile = entity.CurrentGamePosition;
+      const lunging = appearance.IsAnimatingAction && !entity.IsMoving && tile;
       const position = {
-        x: appearance.Position.x,
+        x: lunging ? tile.X + 0.5 : appearance.Position.x,
         y: appearance.Position.y - appearance.Height / 2,
-        z: appearance.Position.z
+        z: lunging ? tile.Z + 0.5 : appearance.Position.z
       };
       // CurrentDirection is the world-space facing; the sprite's "apparent" direction
       // is relative to the camera and must not be used for a 3D model.

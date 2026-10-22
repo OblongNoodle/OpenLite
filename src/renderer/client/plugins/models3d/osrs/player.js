@@ -48,6 +48,28 @@ const SEQUENCES = {
 const COMBAT_ACTIVITIES = new Set([Activity.Melee, Activity.Ranged, Activity.Magic]);
 // Player-skeleton NPCs (men, guards...) fight with the player's own moves.
 const HUMAN_COMBAT = { attack: 422, block: 424, death: 836 };
+// A player's melee attack and block by the weapon they hold (OSRS sequence
+// ids; RuneLite's gameval names in brackets), matched on the weapon's name.
+// Unarmed falls back to HUMAN_COMBAT.
+const WEAPON_COMBAT = [
+  [/great sword|2h sword/, { attack: 407, block: 410 }], // HUMAN_DHSWORD_SLASH
+  [/axe|hatchet/, { attack: 395, block: 397 }], // HUMAN_AXE_HACK (pickaxes below)
+  [/sword|scimitar|knife/, { attack: 390, block: 387 }], // HUMAN_SWORD_SLASH
+  [/dagger/, { attack: 386, block: 387 }], // HUMAN_SWORD_STAB
+  [/mace|hammer|club/, { attack: 401, block: 403 }], // HUMAN_BLUNT_POUND
+  [/staff|wand/, { attack: 413, block: 415 }], // HUMAN_STAFF_POUND
+  [/spear|halberd/, { attack: 428, block: 430 }] // HUMAN_SPEAR_SPIKE
+];
+// Pickaxes fight with the blunt pound (HUMAN_BLUNT_POUND).
+const PICKAXE_COMBAT = { attack: 401, block: 403 };
+// The game's equipment slot that holds the weapon.
+const WEAPON_SLOT = 4;
+
+function weaponCombat(name) {
+  if (!name) return HUMAN_COMBAT;
+  if (/pickaxe/.test(name)) return PICKAXE_COMBAT;
+  return WEAPON_COMBAT.find(([pattern]) => pattern.test(name))?.[1] ?? HUMAN_COMBAT;
+}
 // Combat sequence kinds and the name parts that mark them (RAT_ATTACK,
 // GOBLIN_ATTACK_UNARMED, COW_BLOCK, IMP_DEFEND, RAT_DEATH...).
 const COMBAT_KIND = { ATTACK: "attack", BLOCK: "block", DEFEND: "block", DEATH: "death", DIE: "death" };
@@ -442,6 +464,8 @@ export async function buildPlayerData(cache, appearanceIds, colors, gear) {
     faceStart += model.faceCount;
   }
   merged.cornerColors = lightModel(merged, PLAYER_LIGHT);
+  // The weapon's name picks the player's attack and block animations.
+  merged.weapon = String(gear?.[WEAPON_SLOT]?.name ?? "").toLowerCase();
   merged.labels = new Map();
   merged.groups.forEach((label, v) => {
     if (label < 0) return;
@@ -668,9 +692,13 @@ export class OsrsPlayerModel extends RigModel {
   }
 
   // The animation a new attack plays once (-1 for none): an NPC's own attack,
-  // or the player's for their combat style.
+  // or the player's for their combat style. The game leaves a fighting player
+  // in its idle state, so a swing while not skilling is an attack: a bow
+  // shot, or the held weapon's melee attack.
   attackSequence(pose) {
     if (this.data.sequences) return pose.activity === Activity.Dead ? -1 : this.data.sequences.attack;
+    if (pose.activity === Activity.Idle) return /\bbow\b|shortbow|longbow/.test(this.data.weapon) ? SEQUENCES[Activity.Ranged] : weaponCombat(this.data.weapon).attack;
+    if (pose.activity === Activity.Melee) return weaponCombat(this.data.weapon).attack;
     return COMBAT_ACTIVITIES.has(pose.activity) ? SEQUENCES[pose.activity] : -1;
   }
 
@@ -681,7 +709,7 @@ export class OsrsPlayerModel extends RigModel {
   }
 
   blockSequence() {
-    return this.data.sequences ? this.data.sequences.block : HUMAN_COMBAT.block;
+    return this.data.sequences ? this.data.sequences.block : weaponCombat(this.data.weapon).block;
   }
 
   isDeath(id) {
