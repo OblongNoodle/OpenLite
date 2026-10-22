@@ -179,10 +179,11 @@ var ObjectMarkers = class extends Plugin {
     );
   }
 
-  // While Alt is held, each world object under the cursor gets a Tag (or
-  // Untag) entry at the bottom of the menu.
+  // While Alt is held (or OpenLite Mobile's Tag button is on), each world
+  // object under the cursor gets a Tag (or Untag) entry at the bottom of the
+  // menu.
   addMenuItems(args, items, menuItemManager) {
-    if (!this.altHeld || !Array.isArray(items)) return;
+    if (!(this.altHeld || window.openliteTagMode) || !Array.isArray(items)) return;
     const raycast = args[0];
     const actionsAndEntities = raycast?.ActionsAndEntities ?? raycast?._actionsAndEntities ?? [];
     const seen = new Set();
