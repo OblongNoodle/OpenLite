@@ -47,6 +47,12 @@ const OSRS_ITEM_NAMES = [
   [/\bpick\b(?!axe)/, "pickaxe"]
 ];
 
+// Game items whose OSRS counterpart has a different name altogether.
+const OSRS_ITEM_ALIASES = {
+  "basic rod": "fishing rod",
+  "black leather gloves": "leather gloves"
+};
+
 // Gear with names as OSRS knows them, for finding OSRS item models.
 function osrsGear(gear) {
   return Object.fromEntries(Object.entries(gear ?? {}).map(([slot, item]) => {
@@ -572,8 +578,10 @@ var Models3D = class extends Plugin {
     // Item tables (the inventory) number their cells; the equipment window
     // lays its cells out in columns (LOADOUT_CELL_SLOTS).
     const cells = [];
-    for (const table of document.querySelectorAll(".hs-item-table--inventory")) {
-      for (const cell of table.querySelectorAll("[data-slot]")) cells.push([cell, player?._inventory?._items, Number(cell.dataset.slot)]);
+    for (const [selector, items] of [[".hs-item-table--inventory", player?._inventory?._items], [".hs-item-table--bank", player?._bankItems?._items]]) {
+      for (const table of document.querySelectorAll(selector)) {
+        for (const cell of table.querySelectorAll("[data-slot]")) cells.push([cell, items, Number(cell.dataset.slot)]);
+      }
     }
     for (const menu of document.querySelectorAll(".hs-loadout-menu")) {
       const loadoutCells = [...menu.querySelectorAll(".hs-loadout-menu__item-cell")];
@@ -602,7 +610,9 @@ var Models3D = class extends Plugin {
   async osrsIconFor(name) {
     const cache = await OsrsCache.open();
     const osrsName = osrsGear({ 0: { name } })[0].name;
-    for (const candidate of [name, osrsName, osrsName.replace(/\bhelm\b/, "med helm")]) {
+    const alias = OSRS_ITEM_ALIASES[osrsName];
+    const candidates = [name, osrsName, osrsName.replace(/\bhelm\b/, "med helm"), osrsName.replace(/s$/, ""), alias].filter(Boolean);
+    for (const candidate of candidates) {
       const url = await osrsItemIcon(cache, candidate);
       if (url) return url;
     }

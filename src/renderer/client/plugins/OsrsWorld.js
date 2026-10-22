@@ -10,6 +10,7 @@ import { buildOsrsGround, buildTerrainGeometry, readImage } from "./osrsworld/te
 import { osrsStyleTexture } from "./osrsworld/textures.js";
 import { MODEL_DEFAULT_TEXTURES, osrsTextureCanvas, osrsTextureForFile } from "./osrsworld/osrsTextures.js";
 import { OsrsFences } from "./osrsworld/fences.js";
+import { OsrsRoofs } from "./osrsworld/roofs.js";
 
 // Map levels in the client.
 const MapLevel = { EarthUnderground: 0, EarthOverworld: 1, EarthSky: 2, MoonUnderground: 3, MoonOverworld: 4 };
@@ -127,6 +128,12 @@ var OsrsWorld = class extends Plugin {
         value: true,
         callback: () => this.settings.hideDecorativePlants.value || this.showDecorativePlants()
       },
+      osrsRoofs: {
+        text: "OSRS pitched roofs",
+        type: SettingsTypes.checkbox,
+        value: true,
+        callback: () => this.settings.osrsRoofs.value || this.removeRoofs()
+      },
       osrsFences: {
         text: "OSRS fences (from your OSRS cache)",
         type: SettingsTypes.checkbox,
@@ -175,6 +182,7 @@ var OsrsWorld = class extends Plugin {
     this.unbakeAll();
     this.restoreTextures();
     this.removeFences();
+    this.removeRoofs();
     this.showDecorativePlants();
     this.restoreWater();
     this.osrsSceneryMaterial?.dispose();
@@ -296,6 +304,8 @@ var OsrsWorld = class extends Plugin {
     this.osrsSceneryMaterial.emissiveColor.set(level("r"), level("g"), level("b"));
     this.stoneMaterial?.emissiveColor.set(level("r"), level("g"), level("b"));
     if (this.waterMaterial?.disableLighting) this.waterMaterial.emissiveColor.set(level("r"), level("g"), level("b"));
+    for (const material of this.roofMaterials ?? []) material.emissiveColor.set(level("r"), level("g"), level("b"));
+    this.roofs?.syncVisibility();
   }
 
   // OSRS fence objects in place of the game's fence walls (see fences.js).
@@ -309,6 +319,36 @@ var OsrsWorld = class extends Plugin {
     this.fences ??= new OsrsFences(scene, () => this.gameHooks.WorldEntityManager?.Instance?.WorldEntities);
     this.fences.update(material).catch((error) => this.error("Building OSRS fences failed", error));
     if (this.settings.hideDecorativePlants.value) this.hideDecorativePlants(scene);
+    if (this.settings.osrsRoofs.value) {
+      const manager = this.gameHooks.WorldEntityManager?.Instance;
+      this.roofs ??= new OsrsRoofs(scene, () => manager?._roofs, () => manager?.WorldEntities);
+      this.roofs.update((canvas, file) => this.roofMaterial(scene, canvas, file)).catch((error) => this.error("Building OSRS roofs failed", error));
+    }
+  }
+
+  // Unlit, textured material for OSRS roofs (light is in the vertex colours;
+  // the emissive colour follows the scene's light, see updateSceneryBrightness).
+  roofMaterial(scene, canvas, file) {
+    const template = scene.materials.find((m) => m.getClassName() === "StandardMaterial");
+    const Texture = scene.textures.find((t) => t.getClassName() === "Texture")?.constructor;
+    if (!template || !Texture) return null;
+    const Color3 = template.diffuseColor.constructor;
+    const material = new template.constructor(`osrsworld-roof-${file}`, scene);
+    material.disableLighting = true;
+    material.diffuseTexture = new Texture(canvas.toDataURL(), scene, false, true, NEAREST_SAMPLING);
+    material.diffuseColor = new Color3(0, 0, 0);
+    material.specularColor = new Color3(0, 0, 0);
+    material.emissiveColor = new Color3(1, 1, 1);
+    material.backFaceCulling = false;
+    this.roofMaterials ??= new Set();
+    this.roofMaterials.add(material);
+    return material;
+  }
+
+  removeRoofs() {
+    this.roofs?.dispose();
+    this.roofs = null;
+    this.roofMaterials = null;
   }
 
   // Hides the game's purely decorative plants (no actions: big leafy plants,
@@ -360,7 +400,7 @@ var OsrsWorld = class extends Plugin {
   // Merged meshes use a MultiMaterial; its sub-materials are included.
   *objectMaterials(mesh) {
     const material = mesh.material;
-    if (!material || mesh.billboardMode || mesh.name === GROUND_MESH_NAME || mesh.name.startsWith("models3d")) return;
+    if (!material || mesh.billboardMode || mesh.name === GROUND_MESH_NAME || mesh.name.startsWith("models3d") || mesh.name.startsWith("osrsworld")) return;
     const materials = material.getClassName() === "MultiMaterial" ? material.subMaterials : [material];
     for (const sub of materials) if (sub?.getClassName?.() === "StandardMaterial") yield sub;
   }
@@ -672,7 +712,7 @@ var OsrsWorld = class extends Plugin {
   isBakeable(mesh) {
     const material = mesh.material;
     return !!material && material.getClassName() === "StandardMaterial" && !mesh.billboardMode &&
-      mesh.name !== GROUND_MESH_NAME && !mesh.name.startsWith("models3d") &&
+      mesh.name !== GROUND_MESH_NAME && !mesh.name.startsWith("models3d") && !mesh.name.startsWith("osrsworld") &&
       !this.skippedMaterials.has(material) && (this.bakedMaterials.has(material) || !!material.diffuseTexture) &&
       !!mesh.getVerticesData?.("uv");
   }
