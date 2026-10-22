@@ -1,6 +1,6 @@
 // Reading colours and shapes out of the game's 2D sprite art.
 
-const ASSET_MANIFEST_URL = "https://highspell.com:3002/assetsClient";
+const ASSET_MANIFEST_URL = "https://api.openspell.dev/assetsClient";
 
 // Below this RGB distance (0-1 per channel) two sampled colours count as the same,
 // e.g. a "beard" sample that is really just chin skin.

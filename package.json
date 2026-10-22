@@ -1,8 +1,8 @@
 {
-  "name": "highlite",
-  "productName": "HighLite",
+  "name": "openlite",
+  "productName": "OpenLite",
   "version": "3.0.0",
-  "description": "A RuneLite-esque Client for the game High Spell",
+  "description": "A RuneLite-esque Client for the game OpenSpell",
   "homepage": "https://github.com/Highl1te/HighliteDesktop#readme",
   "engines": {
     "node": "^22.x.x"
@@ -37,7 +37,7 @@
     "files": [
       "out/**/*.*"
     ],
-    "productName": "HighLite",
+    "productName": "OpenLite",
     "publish": [
       {
         "provider": "github",

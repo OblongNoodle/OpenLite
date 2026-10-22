@@ -97,24 +97,35 @@ export async function createClientWindow() {
         });
     });
 
-    // In development, modify requests to High Spell servers
-    if (!app.isPackaged) {
-        // Set user agent and origin for High Spell compatibility
-        mainWindow.webContents.setUserAgent(
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-        );
-
-        mainWindow.webContents.session.webRequest.onBeforeSendHeaders(
-            (details, callback) => {
-                if (details.url.includes('highspell.com')) {
-                    details.requestHeaders['Origin'] = 'https://highspell.com';
-                    details.requestHeaders['Referer'] =
-                        'https://highspell.com/';
-                }
-                callback({ requestHeaders: details.requestHeaders });
+    // OpenSpell's servers expect requests from its own site: set the user
+    // agent, origin and referer, allow the client to read the responses, and
+    // let its cookies travel with the cross-site game form (as
+    // OpenLiteDesktop does).
+    mainWindow.webContents.setUserAgent(
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    );
+    const openSpellRequests = { urls: ['*://*.openspell.dev/*', '*://openspell.dev/*'] };
+    mainWindow.webContents.session.webRequest.onBeforeSendHeaders(
+        openSpellRequests,
+        (details, callback) => {
+            details.requestHeaders['Origin'] = 'https://openspell.dev';
+            details.requestHeaders['Referer'] = 'https://openspell.dev/';
+            callback({ requestHeaders: details.requestHeaders });
+        }
+    );
+    mainWindow.webContents.session.webRequest.onHeadersReceived(
+        openSpellRequests,
+        (details, callback) => {
+            const responseHeaders = details.responseHeaders || {};
+            responseHeaders['Access-Control-Allow-Origin'] = ['*'];
+            if (responseHeaders['set-cookie']) {
+                responseHeaders['set-cookie'] = responseHeaders['set-cookie'].map(
+                    cookie => cookie.replace(/; SameSite=(Lax|Strict|None)/gi, '').replace(/; Secure/gi, '') + '; SameSite=None; Secure'
+                );
             }
-        );
-    }
+            callback({ responseHeaders });
+        }
+    );
 
     mainWindow.on('ready-to-show', () => {
         // Always start with zoom reset to 0.0

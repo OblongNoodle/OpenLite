@@ -236,9 +236,9 @@ var DefinitionsPanel = class extends Plugin {
   async loadLootData() {
     try {
       this.log("Loading loot data...");
-      const response = await fetch(
-        "https://highspell.com:8887/static/npcloot.17.carbon"
-      );
+      // The loot table's address comes from the game's asset manifest.
+      const manifest = await fetch("https://api.openspell.dev/assetsClient").then((r) => r.json());
+      const response = await fetch(manifest.data.files.defs.npcLoot);
       if (!response.ok) {
         throw new Error(
           `HTTP ${response.status}: ${response.statusText}`

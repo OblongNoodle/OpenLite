@@ -4735,7 +4735,7 @@ var pn = class {
     console.info("[Highlite] Core Initializing!"), document.highlite = { managers: {}, gameHooks: {}, gameLookups: {} }, this.pluginManager = new at(), this.hookManager = new tt(), this.contextMenuManager = new et(), this.notificationManager = new it(), this.uiManager = new Ee(), this.panelManager = new _e(), this.soundManager = new ut(), this.settingsManager = new Ie(), this.databaseManager = new pe(), this.pluginDataManager = new lt(), this.initialize();
   }
   async loginHooks(t, ...i) {
-    t === "LoginScreen_handleRegisterButtonClicked" && window.open("https://highspell.com/register", "_blank"), t === "LoginScreen_handleHomeButtonClicked" && window.open("https://highspell.com/", "_blank");
+    t === "LoginScreen_handleRegisterButtonClicked" && window.open("https://openspell.dev/register", "_blank"), t === "LoginScreen_handleHomeButtonClicked" && window.open("https://openspell.dev/", "_blank");
   }
   async startHook(t, ...i) {
     await this.settingsManager.init(), await this.settingsManager.registerPlugins(), await this.pluginDataManager.initialize();

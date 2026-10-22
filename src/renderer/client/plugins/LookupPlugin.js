@@ -36,7 +36,7 @@ var LookupPlugin = class extends Plugin {
   handlePlayerLookup(actionInfo, clickInfo) {
     const player = actionInfo.getEntity();
     const playerName = player._name;
-    window.open(`https://highspell.com/hiscores/player/${playerName}`);
+    window.open(`https://openspell.dev/hiscores/player/${playerName}`);
   }
   //It is possible to look up objects by id, object._def._id, however, the wiki does not store the ID's currently.
   //They also struggle with figuring out how to get pictures of everything without manually doing so.

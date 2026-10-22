@@ -28,7 +28,7 @@ import { setupWorldSelectorObserver } from './helpers/worldSelectHelper';
 await window.settings.getAll();
 
 async function obtainGameClient() {
-    const highspellAssetsURL = 'https://highspell.com:3002/assetsClient';
+    const highspellAssetsURL = 'https://api.openspell.dev/assetsClient';
 
     const highliteResources = new HighliteResources();
     await highliteResources.init();
@@ -47,7 +47,7 @@ async function obtainGameClient() {
     async function fetchLatestClient() {
 
         // Define the highspell url
-        const highSpellClientURL = `https://highspell.com/js/client/client.${highSpellAssetJSON.data.latestClientVersion}.js`;
+        const highSpellClientURL = `https://cdn.openspell.dev/js/client/client.${highSpellAssetJSON.data.latestClientVersion}.js`;
 
         // Log the url
         console.log(highSpellClientURL);
@@ -72,17 +72,37 @@ async function obtainGameClient() {
         // Reflect the game hooks
         await Reflector.loadHooksFromSource(highSpellClient);
 
-        // Inject the hook handlers
-        highSpellClient =
-            highSpellClient.substring(0, highSpellClient.length - 9) +
-            '; document.client = {};' +
-            'document.client.get = function(a) {' +
-            'return eval(a);' +
-            '};' +
-            'document.client.set = function(a, b) {' +
-            "eval(a + ' = ' + b);" +
-            '};' +
-            highSpellClient.substring(highSpellClient.length - 9);
+        // Inject the hook handlers. OpenSpell's client is split into several
+        // strict-mode modules, so a scope-capturing probe goes into each one
+        // and get/set search every scope (as OpenLiteDesktop does).
+        const hookCode = `window.highliteScopes = window.highliteScopes || [];
+        window.highliteScopes.push(function (a) {
+            return eval(a);
+        });
+        if (!document.client) {
+            document.client = {};
+            document.client.get = function (a) {
+                for (let i = 0; i < window.highliteScopes.length; i++) {
+                    try {
+                        let res = window.highliteScopes[i](a);
+                        if (res !== undefined) return res;
+                    } catch (e) {}
+                }
+            };
+            document.client.set = function (a, b) {
+                for (let i = 0; i < window.highliteScopes.length; i++) {
+                    try {
+                        window.highliteScopes[i](a + " = " + b);
+                        return;
+                    } catch (e) {}
+                }
+            };
+        }`;
+        if (highSpellClient.includes('"use strict";')) {
+            highSpellClient = highSpellClient.replace(/"use strict";/g, '"use strict";' + hookCode);
+        } else {
+            highSpellClient = highSpellClient.replace(/\{/, '{' + hookCode);
+        }
 
         // Save latest version
         await highliteResources.setItem('highSpellClient', highSpellClient);
@@ -114,17 +134,25 @@ async function obtainGameClient() {
     return Promise.resolve(highSpellClient);
 }
 
-// POST Request to https://highspell.com/game
+// OpenSpell's play page carries the CSRF token the game form needs.
+const playResponse = await fetch('https://openspell.dev/play', { credentials: 'include' });
+const playDoc = new DOMParser().parseFromString(await playResponse.text(), 'text/html');
+const csrfToken = playDoc.querySelector('input[name="_csrf"]')?.getAttribute('value');
+if (!csrfToken) console.error('[OpenLite] No CSRF token on https://openspell.dev/play');
+
+// POST Request to https://openspell.dev/game
 const urlencoded = new URLSearchParams();
+if (csrfToken) urlencoded.append('_csrf', csrfToken);
 urlencoded.append('submit', 'World+1');
 urlencoded.append('serverid', '1');
-urlencoded.append('serverurl', 'https://server1.highspell.com:8888');
+urlencoded.append('serverurl', 'https://server1.openspell.dev');
 
-const response = await fetch('https://highspell.com/game', {
+const response = await fetch('https://openspell.dev/game', {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: urlencoded,
     redirect: 'follow',
+    credentials: 'include'
 });
 const text = await response.text();
 
@@ -142,7 +170,7 @@ Array.from(doc.head.children).forEach(child => {
         if (child.hasAttribute('href')) {
             const href = child.getAttribute('href');
             if (href && href.startsWith('/')) {
-                child.setAttribute('href', 'https://highspell.com' + href);
+                child.setAttribute('href', 'https://openspell.dev' + href);
             }
         }
         document.head.appendChild(child.cloneNode(true));
@@ -155,7 +183,7 @@ Array.from(doc.body.children).forEach(child => {
         if (child.hasAttribute('href')) {
             const href = child.getAttribute('href');
             if (href && href.startsWith('/')) {
-                child.setAttribute('href', 'https://highspell.com' + href);
+                child.setAttribute('href', 'https://openspell.dev' + href);
             }
         }
 
