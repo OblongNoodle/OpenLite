@@ -16,6 +16,60 @@ export const OSRS_TEXTURE_FOR = new Map([
   ["3.png", 0] // dark wood planks
 ]);
 
+// Game textures with no single OSRS counterpart, built from OSRS textures.
+// The game's timber wall (plaster with one big diagonal beam per tile)
+// becomes an OSRS Tudor panel: plaster framed by wooden posts and rails,
+// which repeats along a wall into the familiar grid.
+const TIMBER_PANEL = {
+  plaster: 47,
+  wood: 16,
+  // Beam widths as a share of the panel: posts at both sides, rails along
+  // the top and bottom (half each, so stacked panels share one) and middle.
+  post: 0.09,
+  rail: 0.07,
+  middleRail: 0.08
+};
+const COMPOSITE_TEXTURES = new Map([["26.png", timberPanel]]);
+
+async function timberPanel() {
+  const [plaster, wood] = await Promise.all([osrsTextureCanvas(TIMBER_PANEL.plaster), osrsTextureCanvas(TIMBER_PANEL.wood)]);
+  if (!plaster || !wood) return null;
+  const size = plaster.width;
+  const canvas = document.createElement("canvas");
+  canvas.width = canvas.height = size;
+  const context = canvas.getContext("2d");
+  context.imageSmoothingEnabled = false;
+  context.drawImage(plaster, 0, 0, size, size);
+  // Rails take the wood as it lies (grain along them); posts take it turned.
+  const rail = (y, height) => context.drawImage(wood, 0, 0, wood.width, wood.height * (height / size), 0, y, size, height);
+  const post = (x, width) => {
+    context.save();
+    context.translate(x + width, 0);
+    context.rotate(Math.PI / 2);
+    context.drawImage(wood, 0, 0, wood.width, wood.height * (width / size), 0, 0, size, width);
+    context.restore();
+  };
+  const postWidth = Math.round(size * TIMBER_PANEL.post / 2), railHeight = Math.round(size * TIMBER_PANEL.rail / 2);
+  const middle = Math.round(size * TIMBER_PANEL.middleRail);
+  rail(0, railHeight);
+  rail(size - railHeight, railHeight);
+  rail(Math.round(size / 2 - middle / 2), middle);
+  post(0, postWidth);
+  post(size - postWidth, postWidth);
+  return canvas;
+}
+
+// The OSRS texture (a canvas) to draw in place of a game texture file, or
+// null if it has none.
+export async function osrsTextureForFile(file) {
+  if (COMPOSITE_TEXTURES.has(file)) {
+    if (!canvases.has(file)) canvases.set(file, COMPOSITE_TEXTURES.get(file)().catch(() => null));
+    return canvases.get(file);
+  }
+  const id = OSRS_TEXTURE_FOR.get(file);
+  return id === undefined ? null : osrsTextureCanvas(id);
+}
+
 // Textures the game's models use when their spec names none (from each
 // model's .mtl file), by material name.
 export const MODEL_DEFAULT_TEXTURES = new Map([

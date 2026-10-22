@@ -3,9 +3,11 @@
 // tile corner, no texture.
 //
 // - Underlay colours are blended: each tile takes the average colour of the
-//   11x11 tiles around it, in HSL, with hue weighted by chroma. A tile's
-//   corners take the blended colours around them, and the GPU shades
-//   between corners, so underlays change smoothly from tile to tile.
+//   11x11 tiles around it, in HSL, with hue weighted by chroma. That one
+//   colour is the whole tile's: all four corners share it and only their
+//   lightness differs (SceneGraph.setTile gets the same colour four times).
+//   So the ground is a fine mosaic of tile colours with smooth light and
+//   shade over it, not a smooth blend of colours.
 // - Every tile corner gets a lightness from the slope of the land there, lit
 //   from the same direction as models: 74 + (normal . light) / 214, which is
 //   86 on flat ground. Where a map gives no heights, the client makes them up
@@ -13,26 +15,33 @@
 //   everywhere, so the light changes from corner to corner, and that is what
 //   gives OSRS ground its mottled look. The game's land is nearly flat, so the
 //   same noise is added for lighting only (the ground stays where it is).
-// - Overlays (paths, floors) shade between corners like underlays and stone
-//   overlays carry an OSRS texture (lit per corner, as the client lights
-//   textured tiles). They
-//   are tile shapes: full squares, plus the half of a grass tile cut
+// - Overlays (paths, floors) are one colour per tile too, lit per corner;
+//   stone overlays carry an OSRS texture instead (lit per corner, as the
+//   client lights textured tiles). They have crisp edges and are tile
+//   shapes: full squares, plus the half of a grass tile cut
 //   corner to corner where a path steps, so their edges are straight lines.
+//
+// OSRS maps are hand-shaded: grass wears to brown-green beside paths, darkens
+// under trees, greys around rocks, grows lush by water. Here rules do that:
+// each tile is tinted toward the colour of the features near it, fading out
+// with distance (see FEATURE_TINTS).
 //
 // The game gives us one painted colour per tile with roads already in it.
 // Grass is underlay, as in OSRS maps; earth and stone (paths, dirt patches,
-// floors) are overlays. OSRS maps mix several
-// underlays (grass of a few shades); the game has one, so a gentle
-// low-frequency variation is added in their place. The game's colours are
-// also moved toward OSRS's palette (olive grass, brown earth).
+// floors) are overlays. OSRS maps mix many underlays (grass of several
+// shades, dirt creeping in) and blending them gives the ground its gradual
+// build-ups of colour; the game has one grass, so layered noise over the
+// world stands in for them. The game's colours are also moved toward OSRS's
+// muted palette (grey-olive grass, olive-brown paths).
 
 // Underlay blending reaches this many tiles each way (the client uses 5).
 const BLEND_RADIUS = 5;
 // Passes of evening out path outlines (see smoothOutline).
 const OUTLINE_PASSES = 2;
-// Overlay tiles blend with similar overlay tiles this close by.
-const OVERLAY_BLEND_RADIUS = 2;
-const OVERLAY_SIMILARITY = 0.2;
+// Overlay tiles blend with similar overlay tiles this close by: an OSRS path
+// is one overlay type, one colour, where the game paints each tile its own.
+const OVERLAY_BLEND_RADIUS = 4;
+const OVERLAY_SIMILARITY = 0.3;
 // The client's light for terrain, as a direction toward the light in image
 // space (x right, y up from the ground, z down the image), from its
 // (-50, -10, -50) with RS axes converted.
@@ -42,23 +51,57 @@ const LIGHT = [-50, 10, 50];
 const BASE_LIGHTNESS = 74;
 const LIGHT_DIVISOR = 214;
 const FLAT_LIGHTNESS = 86;
+// Corner lightness factors are kept in this range: the game cuts ponds and
+// rivers as near-vertical drops, far steeper than OSRS land, and the
+// formula would light the far side of such a bank black.
+const MIN_LIGHT = 0.55;
+const MAX_LIGHT = 1.35;
 // RS units per tile, for converting our heights to the client's scale.
 const RS_UNITS_PER_TILE = 128;
 // Tiles below this alpha are holes in the game's ground (water shows
 // through); ours has a bed there, this colour where nothing borders it.
 const HOLE_ALPHA = 130;
 const WATER_BED = [0.09, 0.3, 0.26];
+// How far below the water surface beds are kept, in tiles.
+const BED_DEPTH = 0.3;
+// Grey ground lower than this above the water is bank, not paving.
+const BANK_HEIGHT = 0.75;
 // OSRS texture on stone overlays (paving), and the lightness of a textured
 // tile on flat ground (the texture carries the colour).
 export const STONE_TEXTURE = 43;
 const TEXTURED_LIGHTNESS = 0.82;
 // The client's made-up heights: getTileHeight's 10-60 times 8 RS units.
 const NOISE_HEIGHT_SCALE = 8;
-// Underlay variation: hue and lightness drift over patches this many tiles
-// across, by up to these amounts.
-const VARIATION_SCALE = 6;
-const VARIATION_HUE = 0.012;
-const VARIATION_LIGHTNESS = 0.07;
+// Height noise in the lighting per unit of tile visibility (0-1); the
+// default 0.5 gives 70% of the client's own, which reads closer to OSRS on
+// the game's softer colours.
+const NOISE_STRENGTH = 1.4;
+// Underlay variation, standing in for OSRS's mixed underlays: layers of noise
+// over the world, each { scale in tiles, and how far it moves hue,
+// saturation (factor) and lightness (factor) }.
+const VARIATION_LAYERS = [
+  { scale: 23, hue: -0.025, saturation: 0.3, lightness: 0.1 }, // yellow-green to green
+  { scale: 11, hue: 0.01, saturation: -0.35, lightness: 0.08 }, // grey-green to rich green
+  { scale: 5, hue: 0, saturation: 0.1, lightness: 0.08 } // lighter and darker patches
+];
+// Each tile's own small nudge (hue, saturation factor, lightness factor), as
+// a mix of underlays gives OSRS tiles: tiles near a step of the client's
+// 16-bit colour land either side of it, so every shade between gets used.
+const TILE_JITTER = { hue: 0.006, saturation: 0.09, lightness: 0.025 };
+// Grass near features, by feature: how far the tint reaches (tiles) and what
+// it does at full strength (hue moved toward `hue` by `hueMix`, saturation
+// and lightness multiplied). Strength fades from 1 beside the feature to 0
+// at `reach`.
+const FEATURE_TINTS = {
+  path: { reach: 4, hue: 0.16, hueMix: 0.45, saturation: 1.1, lightness: 0.97 }, // worn, brown-green
+  tree: { reach: 3, hue: 0.27, hueMix: 0.25, saturation: 1.15, lightness: 0.88 }, // shaded, rich green
+  rock: { reach: 2.5, hue: 0.21, hueMix: 0.2, saturation: 0.78, lightness: 0.97 }, // grey-green
+  water: { reach: 3, hue: 0.28, hueMix: 0.4, saturation: 1.25, lightness: 0.9 }, // lush, deep green
+  building: { reach: 2, hue: 0.2, hueMix: 0.2, saturation: 0.75, lightness: 0.9 } // trodden, greyer
+};
+// Dirt creeping into grass: where its noise (scale in tiles) is above `from`,
+// grass mixes toward this colour, by up to `amount`.
+const DIRT_PATCHES = { scale: 13, from: 0.25, to: 0.85, amount: 0.5, color: [0.13, 0.3, 0.31] };
 
 // The client's height noise (PerlinNoise in the 2009 client): hashed values
 // smoothed over their neighbours, cosine-interpolated, in three octaves.
@@ -101,10 +144,77 @@ function noiseHeight(worldX, worldY) {
 
 // Moves the game's ground colours toward OSRS's palette, keeping their own
 // light and dark: grass toward a lighter olive green, earth toward brown.
+// Targets measured from OSRS: grass around hue 0.23, saturation 0.2-0.25,
+// lightness 0.34; dirt paths olive-brown, hue 0.14, saturation 0.3,
+// lightness 0.33.
 function osrsPalette([h, s, l], surface) {
-  if (surface === "grass") return [h + (0.255 - h) * 0.6, 0.25 + s * 0.3, 0.18 + l * 0.5];
-  if (surface === "earth") return [h + (0.08 - h) * 0.5, 0.2 + s * 0.35, 0.12 + l * 0.75];
-  return [h, s * 0.5, l];
+  if (surface === "grass") return [h + (0.235 - h) * 0.85, 0.12 + s * 0.15, 0.22 + l * 0.45];
+  if (surface === "earth") return [h + (0.13 - h) * 0.7, 0.18 + s * 0.25, 0.12 + l * 0.55];
+  return [h, s * 0.4, l];
+}
+
+function mixHsl(a, b, t) {
+  return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
+}
+
+// Distance in tiles (1 beside, diagonal 1.41) from each tile to the nearest
+// seed tile, out to `reach` (Infinity beyond): a two-pass chamfer transform.
+function distanceField(seeds, tilesX, tilesY, reach) {
+  const field = new Float32Array(tilesX * tilesY).fill(Infinity);
+  for (const i of seeds) field[i] = 0;
+  const relax = (i, j, step) => {
+    if (field[j] + step < field[i]) field[i] = field[j] + step;
+  };
+  for (let y = 0; y < tilesY; y++) {
+    for (let x = 0; x < tilesX; x++) {
+      const i = y * tilesX + x;
+      if (x > 0) relax(i, i - 1, 1);
+      if (y > 0) {
+        relax(i, i - tilesX, 1);
+        if (x > 0) relax(i, i - tilesX - 1, Math.SQRT2);
+        if (x < tilesX - 1) relax(i, i - tilesX + 1, Math.SQRT2);
+      }
+    }
+  }
+  for (let y = tilesY - 1; y >= 0; y--) {
+    for (let x = tilesX - 1; x >= 0; x--) {
+      const i = y * tilesX + x;
+      if (x < tilesX - 1) relax(i, i + 1, 1);
+      if (y < tilesY - 1) {
+        relax(i, i + tilesX, 1);
+        if (x < tilesX - 1) relax(i, i + tilesX + 1, Math.SQRT2);
+        if (x > 0) relax(i, i + tilesX - 1, Math.SQRT2);
+      }
+    }
+  }
+  return field.map((d) => (d > reach ? Infinity : d));
+}
+
+// A colour tinted toward a feature's, by strength 0-1.
+function tint([h, s, l], feature, strength) {
+  return [
+    h + (feature.hue - h) * feature.hueMix * strength,
+    s * (1 + (feature.saturation - 1) * strength),
+    l * (1 + (feature.lightness - 1) * strength)
+  ];
+}
+
+// An underlay colour with the world's variation at a world position, and
+// the tile's own nudge.
+function varyUnderlay([h, s, l], wx, wy) {
+  const jitter = (salt) => hash(Math.floor(wx) * 1.31 + salt, Math.floor(wy) * 0.77 - salt) * 2 - 1;
+  h += TILE_JITTER.hue * jitter(3.1);
+  s *= 1 + TILE_JITTER.saturation * jitter(7.3);
+  l *= 1 + TILE_JITTER.lightness * jitter(11.9);
+  for (const [k, layer] of VARIATION_LAYERS.entries()) {
+    const n = valueNoise(wx / layer.scale + 17.3 * (k + 1), wy / layer.scale + 5.9 * (k + 1));
+    h += layer.hue * n;
+    s *= 1 + layer.saturation * n;
+    l *= 1 + layer.lightness * n;
+  }
+  const dirt = (valueNoise(wx / DIRT_PATCHES.scale + 71.1, wy / DIRT_PATCHES.scale + 33.7) - DIRT_PATCHES.from) / (DIRT_PATCHES.to - DIRT_PATCHES.from);
+  const t = Math.min(1, Math.max(0, dirt));
+  return mixHsl([h, s, l], DIRT_PATCHES.color, t * t * (3 - 2 * t) * DIRT_PATCHES.amount);
 }
 
 // Snaps a colour to the client's 16-bit HSL (64 hues, 8 saturations, 128
@@ -288,11 +398,14 @@ function smoothOutline(overlay, solid, tilesX, tilesY) {
 //     (corner 0, 0 is the image's top-left).
 //   worldOrigin: world tile coordinates of corner 0, 0 ({ x, y }, y growing
 //     down the image), so the height noise lines up across regions.
-//   tileVisibility: 0-1, strength of the height noise in the lighting (0.5
-//     is the client's own), which makes the tiles more or less visible.
+//   tileVisibility: 0-1, strength of the height noise in the lighting (see
+//     NOISE_STRENGTH), which makes the tiles more or less visible.
+//   waterLevel: height of the water surface in the ground's space, if any.
+//   features: tile indices of objects that tint the grass around them
+//     ({ tree, rock, building }: arrays); paths and water come from the map.
 // Returns vertex data in the ground's space (positions, colors as RGBA,
 // indices), and the same plus uvs for the textured part (textured).
-export function buildOsrsGround(colors, cornerPosition, worldOrigin, tileVisibility = 0.5) {
+export function buildOsrsGround(colors, cornerPosition, worldOrigin, tileVisibility = 0.5, waterLevel = null, features = {}) {
   const tilesX = colors.width, tilesY = colors.height;
   const cornersX = tilesX + 1;
 
@@ -304,8 +417,35 @@ export function buildOsrsGround(colors, cornerPosition, worldOrigin, tileVisibil
     own.push(rgbToHsl(colors.pixels[p] / 255, colors.pixels[p + 1] / 255, colors.pixels[p + 2] / 255));
   }
   // Surfaces are judged on the game's colours; blending uses OSRS's palette.
+  // Corners around water: the game cuts its beds far below the water, and
+  // their square corners stick out past the round water surface as pits, so
+  // the bed is raised to just under the water (OSRS pond margins are mud).
+  const touchesWater = (cx, cy) => [[cx - 1, cy - 1], [cx, cy - 1], [cx - 1, cy], [cx, cy]]
+    .some(([x, y]) => x >= 0 && y >= 0 && x < tilesX && y < tilesY && !solid[y * tilesX + x]);
+  const positionAt = (cx, cy) => {
+    const position = cornerPosition(cx, cy);
+    if (waterLevel !== null && touchesWater(cx, cy)) position[1] = Math.max(position[1], waterLevel - BED_DEPTH);
+    return position;
+  };
   const rgb = own.map((hsl) => hslToRgb(...hsl));
-  const surfaces = rgb.map((color) => surfaceOf(...color));
+  // Grey around and at the level of water is the game's pond and river beds
+  // and banks: mud, not paving.
+  const nearWater = (i) => {
+    const x = i % tilesX, y = Math.floor(i / tilesX);
+    for (let dy = -2; dy <= 2; dy++) {
+      for (let dx = -2; dx <= 2; dx++) {
+        const nx = x + dx, ny = y + dy;
+        if (nx >= 0 && ny >= 0 && nx < tilesX && ny < tilesY && !solid[ny * tilesX + nx]) return true;
+      }
+    }
+    if (waterLevel === null) return false;
+    const lowest = Math.min(...[[x, y], [x + 1, y], [x, y + 1], [x + 1, y + 1]].map(([cx, cy]) => cornerPosition(cx, cy)[1]));
+    return lowest < waterLevel + BANK_HEIGHT;
+  };
+  const surfaces = rgb.map((color, i) => {
+    const surface = surfaceOf(...color);
+    return surface === "stone" && nearWater(i) ? "earth" : surface;
+  });
   for (let i = 0; i < own.length; i++) own[i] = osrsPalette(own[i], surfaces[i]);
   const distance = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
 
@@ -320,37 +460,48 @@ export function buildOsrsGround(colors, cornerPosition, worldOrigin, tileVisibil
   const overlayBlend = blendTiles(own, tilesX, tilesY, OVERLAY_BLEND_RADIUS,
     (i, center) => solid[i] && painted[i] && distance(rgb[i], rgb[center]) < OVERLAY_SIMILARITY);
 
-  // Colours at each tile corner, from the tiles around it: underlay (with the
-  // gentle variation added) and overlay. Paths shade smoothly between
-  // corners like grass does, while their edges stay crisp.
-  const cornerUnder = new Array(cornersX * (tilesY + 1));
-  const cornerOver = new Array(cornersX * (tilesY + 1));
-  for (let cy = 0; cy <= tilesY; cy++) {
-    for (let cx = 0; cx <= tilesX; cx++) {
-      const unders = [], overs = [];
-      for (const [x, y] of [[cx - 1, cy - 1], [cx, cy - 1], [cx - 1, cy], [cx, cy]]) {
-        if (x < 0 || y < 0 || x >= tilesX || y >= tilesY) continue;
-        const i = y * tilesX + x;
-        if (!solid[i]) continue;
-        if (painted[i]) overs.push(overlayBlend[i] ?? own[i]);
-        else if (underlayBlend[i]) unders.push(underlayBlend[i]);
-      }
-      const c = cy * cornersX + cx;
-      if (overs.length) cornerOver[c] = averageHsl(overs);
-      if (unders.length) {
-        const [h, s, l] = averageHsl(unders);
-        const hueShift = VARIATION_HUE * valueNoise(cx / VARIATION_SCALE + 31.4, cy / VARIATION_SCALE + 2.7);
-        const lightShift = 1 + VARIATION_LIGHTNESS * valueNoise(cx / VARIATION_SCALE, cy / VARIATION_SCALE);
-        cornerUnder[c] = [h + hueShift, s, l * lightShift];
+  // Each tile's colours: its blended underlay (with the world's variation)
+  // and, for paths, its overlay. A path tile the outline smoothing added
+  // takes the colour of the path around it.
+  // Distances to the features that tint grass: paths and water from the
+  // map, objects from `features`.
+  const seeds = {
+    path: painted.flatMap((isPath, i) => (isPath && surfaces[i] === "earth" ? [i] : [])),
+    water: solid.flatMap((isSolid, i) => (isSolid ? [] : [i])),
+    tree: features.tree ?? [],
+    rock: features.rock ?? [],
+    building: features.building ?? []
+  };
+  const distances = Object.fromEntries(Object.entries(FEATURE_TINTS).map(([name, feature]) => [name, distanceField(seeds[name], tilesX, tilesY, feature.reach)]));
+  const underColor = own.map((hsl, i) => {
+    const x = i % tilesX, y = Math.floor(i / tilesX);
+    let color = underlayBlend[i] ?? hsl;
+    for (const [name, feature] of Object.entries(FEATURE_TINTS)) {
+      const d = distances[name][i];
+      if (d === Infinity) continue;
+      // Full strength on and beside the feature, fading out to `reach`.
+      const t = Math.min(1, Math.max(0, (feature.reach - d) / (feature.reach - 1)));
+      color = tint(color, feature, t * t * (3 - 2 * t));
+    }
+    return varyUnderlay(color, worldOrigin.x + x + 0.5, worldOrigin.y + y + 0.5);
+  });
+  const overColor = own.map((hsl, i) => {
+    if (painted[i]) return overlayBlend[i] ?? hsl;
+    const x = i % tilesX, y = Math.floor(i / tilesX), around = [];
+    for (let dy = -1; dy <= 1; dy++) {
+      for (let dx = -1; dx <= 1; dx++) {
+        const nx = x + dx, ny = y + dy;
+        if (nx >= 0 && ny >= 0 && nx < tilesX && ny < tilesY && painted[ny * tilesX + nx]) around.push(overlayBlend[ny * tilesX + nx] ?? own[ny * tilesX + nx]);
       }
     }
-  }
+    return around.length ? averageHsl(around) : hsl;
+  });
 
   // Corner lightness factors (1.0 on flat ground), from the slope of the
   // land plus the client's height noise.
-  const noiseStrength = tileVisibility * 2;
+  const noiseStrength = tileVisibility * NOISE_STRENGTH;
   const heightAt = (cx, cy) => {
-    const land = cornerPosition(Math.min(tilesX, Math.max(0, cx)), Math.min(tilesY, Math.max(0, cy)))[1] * RS_UNITS_PER_TILE;
+    const land = positionAt(Math.min(tilesX, Math.max(0, cx)), Math.min(tilesY, Math.max(0, cy)))[1] * RS_UNITS_PER_TILE;
     return land + noiseStrength * NOISE_HEIGHT_SCALE * noiseHeight(worldOrigin.x + cx, worldOrigin.y + cy);
   };
   const lightLength = Math.hypot(...LIGHT);
@@ -365,38 +516,29 @@ export function buildOsrsGround(colors, cornerPosition, worldOrigin, tileVisibil
       const dot = normal[0] * LIGHT[0] + normal[1] * LIGHT[1] + normal[2] * LIGHT[2];
       // The client divides by 214 for its 71-unit light; scale for ours.
       const lightness = BASE_LIGHTNESS + (dot * 256 / lightLength * Math.hypot(50, 10, 50)) / LIGHT_DIVISOR;
-      cornerLight[cy * cornersX + cx] = lightness / FLAT_LIGHTNESS;
+      cornerLight[cy * cornersX + cx] = Math.min(MAX_LIGHT, Math.max(MIN_LIGHT, lightness / FLAT_LIGHTNESS));
     }
   }
 
   const plain = { positions: [], colors: [] };
   const textured = { positions: [], colors: [], uvs: [] };
   const vertex = ([cx, cy], hsl) => {
-    plain.positions.push(...cornerPosition(cx, cy));
+    plain.positions.push(...positionAt(cx, cy));
     const light = cornerLight[cy * cornersX + cx];
     const [r, g, b] = hslToRgb(...toHsl16(hsl[0], hsl[1], Math.min(0.99, Math.max(0.01, hsl[2] * light))));
     plain.colors.push(r, g, b, 1);
   };
   // Textured corners carry only the light; the texture repeats once per tile.
   const texturedVertex = ([cx, cy]) => {
-    textured.positions.push(...cornerPosition(cx, cy));
+    textured.positions.push(...positionAt(cx, cy));
     const light = Math.min(1, TEXTURED_LIGHTNESS * cornerLight[cy * cornersX + cx]);
     textured.colors.push(light, light, light, 1);
     textured.uvs.push(worldOrigin.x + cx, worldOrigin.y + cy);
   };
   const stone = (i) => i >= 0 && i < surfaces.length && painted[i] && surfaces[i] === "stone";
-  // A triangle of overlay or underlay, coloured per corner (the other kind's
-  // colour, then the tile's own, where a corner has none of its kind). Stone
-  // overlay (from the tile `source`) is textured instead.
-  const triangle = (corners, asOverlay, i, source = i) => {
-    if (asOverlay && stone(source)) {
-      for (const corner of corners) texturedVertex(corner);
-      return;
-    }
-    for (const [cx, cy] of corners) {
-      const c = cy * cornersX + cx;
-      vertex([cx, cy], (asOverlay ? cornerOver[c] ?? cornerUnder[c] : cornerUnder[c] ?? cornerOver[c]) ?? own[i]);
-    }
+  // A triangle in one colour, lit per corner. Stone overlay is textured.
+  const triangle = (corners, color, textured = false) => {
+    for (const corner of corners) (textured ? texturedVertex(corner) : vertex(corner, color));
   };
 
   const isOverlay = (x, y, self) => {
@@ -417,10 +559,9 @@ export function buildOsrsGround(colors, cornerPosition, worldOrigin, tileVisibil
       if (!solid[i]) {
         // Water: the ground goes on under it as a bed (the water plane covers
         // it), so sloping banks show earth rather than a gap.
-        for (const corner of [corners.NW, corners.NE, corners.SW, corners.NE, corners.SE, corners.SW]) {
-          const c = corner[1] * cornersX + corner[0];
-          vertex(corner, cornerUnder[c] ?? cornerOver[c] ?? WATER_BED);
-        }
+        const bed = underlayBlend[i] ?? WATER_BED;
+        triangle([corners.NW, corners.NE, corners.SW], bed);
+        triangle([corners.NE, corners.SE, corners.SW], bed);
         continue;
       }
       const self = overlay[i];
@@ -437,16 +578,18 @@ export function buildOsrsGround(colors, cornerPosition, worldOrigin, tileVisibil
       else if (n && e && !s && !w) corner = "NE";
       else if (s && w && !n && !e) corner = "SW";
       else if (s && e && !n && !w) corner = "SE";
+      const ownColor = self ? overColor[i] : underColor[i];
       if (!corner) {
         // Two triangles, split from the south-west corner to the north-east.
-        triangle([corners.NW, corners.NE, corners.SW], self, i);
-        triangle([corners.NE, corners.SE, corners.SW], self, i);
+        triangle([corners.NW, corners.NE, corners.SW], ownColor, self && stone(i));
+        triangle([corners.NE, corners.SE, corners.SW], ownColor, self && stone(i));
         continue;
       }
       // The corner half is path from the tile beside it (north or south).
+      const beside = (ty + (corner[0] === "N" ? -1 : 1)) * tilesX + tx;
       const [cornerHalf, rest] = HALVES[corner](corners);
-      triangle(cornerHalf, !self, i, (ty + (corner[0] === "N" ? -1 : 1)) * tilesX + tx);
-      triangle(rest, self, i);
+      triangle(cornerHalf, overColor[beside], stone(beside));
+      triangle(rest, ownColor);
     }
   }
   const indices = (data) => Array.from({ length: data.positions.length / 3 }, (_, k) => k);

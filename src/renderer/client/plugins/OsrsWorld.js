@@ -6,10 +6,9 @@
 // - terrain: one crisp colour per tile and faceted (flat-shaded) hills;
 // - objects: textures baked into one flat colour per face, like OSRS models.
 import { Plugin, SettingsTypes } from "@highlite/core";
-import { buildOsrsGround, buildTerrainGeometry, readImage, tileSurfaces } from "./osrsworld/terrain.js";
-import { buildDecorations, occupiedTiles } from "./osrsworld/decorations.js";
+import { buildOsrsGround, buildTerrainGeometry, readImage } from "./osrsworld/terrain.js";
 import { osrsStyleTexture } from "./osrsworld/textures.js";
-import { MODEL_DEFAULT_TEXTURES, OSRS_TEXTURE_FOR, osrsTextureCanvas } from "./osrsworld/osrsTextures.js";
+import { MODEL_DEFAULT_TEXTURES, osrsTextureCanvas, osrsTextureForFile } from "./osrsworld/osrsTextures.js";
 import { OsrsFences } from "./osrsworld/fences.js";
 
 // Map levels in the client.
@@ -27,6 +26,17 @@ const FENCE_UPDATE_INTERVAL_MS = 500;
 // Names ending in "-halo" are skipped by the game's click picking.
 const OSRS_GROUND_NAME = "osrsworld-ground-halo";
 const OSRS_PAVING_NAME = "osrsworld-paving-halo";
+const WATER_MESH_NAME = "water-plane";
+// Objects that tint the grass around them (see groundFeatures): by name, and
+// building walls by texture.
+const TREE_NAMES = /tree|stump|bush|blossom/i;
+const ROCK_NAMES = /rock/i;
+const BUILDING_TEXTURES = new Set(["14.png", "16.png", "17.png", "26.png", "window1.png"]);
+// OSRS water texture, and how fast it drifts (texture repeats per ms).
+const WATER_TEXTURE = 1;
+const WATER_DRIFT = 0.00004;
+// The game's decorative plants (see hideDecorativePlants), by name.
+const DECORATIVE_PLANTS = new Set(["Plant", "Cat Tails", "Flower"]);
 
 function hexToRgb(hex) {
   const value = parseInt(String(hex).replace("#", ""), 16);
@@ -111,11 +121,11 @@ var OsrsWorld = class extends Plugin {
         value: true,
         callback: () => this.settings.osrsTextures.value || this.restoreTextures()
       },
-      groundDecorations: {
-        text: "OSRS ground clutter (flowers, ferns, pebbles)",
+      hideDecorativePlants: {
+        text: "Hide decorative plants",
         type: SettingsTypes.checkbox,
         value: true,
-        callback: () => this.refreshGround()
+        callback: () => this.settings.hideDecorativePlants.value || this.showDecorativePlants()
       },
       osrsFences: {
         text: "OSRS fences (from your OSRS cache)",
@@ -165,6 +175,8 @@ var OsrsWorld = class extends Plugin {
     this.unbakeAll();
     this.restoreTextures();
     this.removeFences();
+    this.showDecorativePlants();
+    this.restoreWater();
     this.osrsSceneryMaterial?.dispose();
     this.osrsSceneryMaterial = null;
     this.stoneMaterial?.dispose();
@@ -217,6 +229,62 @@ var OsrsWorld = class extends Plugin {
     this.updateAtmosphere(scene);
     this.updateSceneryBrightness();
     this.updateFences(scene);
+    this.updateWater(scene, scene.getEngine().getDeltaTime());
+  }
+
+  // OSRS water: the game's flat blue water plane gets OSRS's water texture
+  // from the player's cache, once per tile, drifting as OSRS water does.
+  updateWater(scene, deltaMs) {
+    const water = scene.getMeshByName(WATER_MESH_NAME);
+    const material = water?.material;
+    if (!material || !window.osrsCache) return;
+    if (this.waterMaterial !== material) {
+      this.restoreWater();
+      this.waterMaterial = material;
+      this.originalWater = {
+        diffuseColor: material.diffuseColor.clone(),
+        emissiveColor: material.emissiveColor.clone(),
+        diffuseTexture: material.diffuseTexture,
+        alpha: material.alpha,
+        disableLighting: material.disableLighting
+      };
+      osrsTextureCanvas(WATER_TEXTURE).then((canvas) => {
+        if (!canvas || this.waterMaterial !== material) return;
+        const Texture = scene.textures.find((t) => t.getClassName() === "Texture")?.constructor;
+        if (!Texture) return;
+        const texture = new Texture(canvas.toDataURL(), scene, false, true, NEAREST_SAMPLING);
+        // OSRS water keeps its own colour: unlit (the emissive colour follows
+        // the scene's light level, see updateSceneryBrightness) and solid.
+        material.unfreeze?.();
+        material.diffuseTexture = texture;
+        material.disableLighting = true;
+        material.diffuseColor.set(0, 0, 0);
+        material.alpha = 1;
+      });
+    }
+    // The plane spans the region with UVs 0-1; repeat once per tile. (Set
+    // every frame: something resets the scale after it is first set.)
+    const texture = material.diffuseTexture;
+    if (texture && texture !== this.originalWater?.diffuseTexture) {
+      const options = this.gameHooks.WorldMapManager?.Instance?._groundMeshOptions;
+      texture.uScale = options?.width ?? 144;
+      texture.vScale = options?.height ?? 144;
+      texture.vOffset = (texture.vOffset + deltaMs * WATER_DRIFT) % 1;
+    }
+  }
+
+  restoreWater() {
+    const material = this.waterMaterial, original = this.originalWater;
+    if (material && original) {
+      if (material.diffuseTexture !== original.diffuseTexture) material.diffuseTexture?.dispose();
+      material.diffuseTexture = original.diffuseTexture;
+      material.diffuseColor.copyFrom(original.diffuseColor);
+      material.emissiveColor.copyFrom(original.emissiveColor);
+      material.alpha = original.alpha;
+      material.disableLighting = original.disableLighting;
+    }
+    this.waterMaterial = null;
+    this.originalWater = null;
   }
 
   // OSRS scenery and ground have their lighting baked in; their brightness
@@ -226,7 +294,8 @@ var OsrsWorld = class extends Plugin {
     if (!light || !this.osrsSceneryMaterial) return;
     const level = (channel) => Math.min(1, Math.max(0.45, light.diffuse[channel] * light.intensity * 1.1));
     this.osrsSceneryMaterial.emissiveColor.set(level("r"), level("g"), level("b"));
-    this.stoneMaterial?.diffuseColor.set(level("r"), level("g"), level("b"));
+    this.stoneMaterial?.emissiveColor.set(level("r"), level("g"), level("b"));
+    if (this.waterMaterial?.disableLighting) this.waterMaterial.emissiveColor.set(level("r"), level("g"), level("b"));
   }
 
   // OSRS fence objects in place of the game's fence walls (see fences.js).
@@ -236,8 +305,34 @@ var OsrsWorld = class extends Plugin {
     if (!material) return;
     if (performance.now() - (this.lastFenceUpdate ?? 0) < FENCE_UPDATE_INTERVAL_MS) return;
     this.lastFenceUpdate = performance.now();
+    if (this.settings.osrsTerrain.value) this.refreshGroundForFeatures();
     this.fences ??= new OsrsFences(scene, () => this.gameHooks.WorldEntityManager?.Instance?.WorldEntities);
     this.fences.update(material).catch((error) => this.error("Building OSRS fences failed", error));
+    if (this.settings.hideDecorativePlants.value) this.hideDecorativePlants(scene);
+  }
+
+  // Hides the game's purely decorative plants (no actions: big leafy plants,
+  // cat tails, flowers). Harvestable ones stay.
+  hideDecorativePlants(scene) {
+    const entities = this.gameHooks.WorldEntityManager?.Instance?.WorldEntities;
+    if (!entities) return;
+    this.hiddenPlants ??= new Set();
+    // An object's parts are separate meshes sharing its name.
+    const names = new Set();
+    for (const [id, entity] of entities) {
+      if (DECORATIVE_PLANTS.has(entity._def?._name) && !entity._def._actions?.length) names.add(`_we_${id}`);
+    }
+    for (const mesh of scene.meshes) {
+      if (names.has(mesh.name) && mesh.isEnabled()) {
+        mesh.setEnabled(false);
+        this.hiddenPlants.add(mesh);
+      }
+    }
+  }
+
+  showDecorativePlants() {
+    for (const mesh of this.hiddenPlants ?? []) if (!mesh.isDisposed()) mesh.setEnabled(true);
+    this.hiddenPlants = null;
   }
 
   removeFences() {
@@ -293,8 +388,7 @@ var OsrsWorld = class extends Plugin {
     this.retextured.set(material, original);
     // Textures with an OSRS counterpart use the real one from the player's
     // OSRS cache; the rest are restyled.
-    const osrsId = OSRS_TEXTURE_FOR.get(this.textureFileOf(material, mesh));
-    let canvas = osrsId === undefined ? null : await osrsTextureCanvas(osrsId);
+    let canvas = await osrsTextureForFile(this.textureFileOf(material, mesh));
     if (material.diffuseTexture !== original) return;
     if (!canvas) {
       const { width, height } = original.getSize();
@@ -425,7 +519,11 @@ var OsrsWorld = class extends Plugin {
     };
     // World tile of corner 0, 0 (the image's top-left), for the height noise.
     const worldOrigin = { x: Math.round(ground.position.x - options.width / 2), y: Math.round(-(ground.position.z + options.height / 2)) };
-    const data = buildOsrsGround(colors, cornerPosition, worldOrigin, this.settings.tileVisibility.value / 10);
+    const water = ground.getScene().getMeshByName(WATER_MESH_NAME);
+    const waterLevel = water ? water.position.y - ground.position.y : null;
+    const features = this.groundFeatures(colors, worldOrigin, ground, options);
+    this.groundFeatureCount = features.count;
+    const data = buildOsrsGround(colors, cornerPosition, worldOrigin, this.settings.tileVisibility.value / 10, waterLevel, features);
     const Mesh = this.scene.meshes.find((m) => m.getClassName() === "Mesh").constructor;
     const osrsGround = new Mesh(OSRS_GROUND_NAME, ground.getScene());
     osrsGround.setVerticesData("position", data.positions, false);
@@ -434,22 +532,8 @@ var OsrsWorld = class extends Plugin {
     osrsGround.material = material;
     osrsGround.isPickable = false;
     osrsGround.parent = ground;
-    // Stone paving, textured; and ground clutter. Both hang off our ground,
-    // so they go with it.
+    // Stone paving, textured; it hangs off our ground, so it goes with it.
     await this.texturedGround(osrsGround, data.textured);
-    if (this.settings.groundDecorations.value) {
-      await buildDecorations({
-        scene: ground.getScene(),
-        material,
-        parent: osrsGround,
-        surfaces: tileSurfaces(colors),
-        tilesX: colors.width,
-        tilesY: colors.height,
-        cornerPosition,
-        worldOrigin,
-        occupied: this.occupiedGroundTiles(colors, worldOrigin, ground, options)
-      }).catch((error) => this.error("Placing ground decorations failed", error));
-    }
     if (ground !== this.groundMesh || ground.isDisposed()) {
       osrsGround.dispose();
       return;
@@ -476,8 +560,9 @@ var OsrsWorld = class extends Plugin {
     return mesh;
   }
 
-  // Unlit, textured, lit by vertex colour; its diffuse colour follows the
-  // scene's light level (see updateSceneryBrightness).
+  // Unlit, textured, lit by vertex colour. With lighting disabled only the
+  // emissive colour reaches the output (times texture and vertex colour), so
+  // that is what follows the scene's light level (see updateSceneryBrightness).
   async stonePavingMaterial(scene, textureId) {
     if (this.stoneMaterial) return this.stoneMaterial;
     const canvas = await osrsTextureCanvas(textureId);
@@ -487,20 +572,56 @@ var OsrsWorld = class extends Plugin {
     const material = new template.constructor("osrsworld-stone", scene);
     material.disableLighting = true;
     material.diffuseTexture = new Texture(canvas.toDataURL(), scene, false, true, NEAREST_SAMPLING);
+    material.diffuseColor = new template.diffuseColor.constructor(0, 0, 0);
     material.specularColor = new template.diffuseColor.constructor(0, 0, 0);
+    material.emissiveColor = new template.diffuseColor.constructor(1, 1, 1);
     material.backFaceCulling = false;
     this.stoneMaterial = material;
     return material;
   }
 
-  // Ground tiles objects stand on, as indices into the region's tiles.
-  occupiedGroundTiles(colors, worldOrigin, ground, options) {
+  // Tiles of the objects that tint the grass around them (see terrain.js
+  // FEATURE_TINTS): trees, rocks and building walls, as tile indices.
+  groundFeatures(colors, worldOrigin, ground, options) {
     const top = ground.position.z + options.height / 2;
     const toTile = (x, z) => {
       const tx = Math.floor(x - worldOrigin.x), ty = Math.floor(top - z);
       return tx >= 0 && ty >= 0 && tx < colors.width && ty < colors.height ? ty * colors.width + tx : -1;
     };
-    return occupiedTiles(this.gameHooks.WorldEntityManager?.Instance?.WorldEntities?.values() ?? [], toTile);
+    const features = { tree: new Set(), rock: new Set(), building: new Set(), count: 0 };
+    const add = (set, x, z) => {
+      const tile = toTile(x, z);
+      if (tile >= 0) set.add(tile);
+    };
+    for (const entity of this.gameHooks.WorldEntityManager?.Instance?.WorldEntities?.values() ?? []) {
+      const appearance = entity._appearance, centre = appearance?._position;
+      if (!centre) continue;
+      const name = entity._def?._name ?? "";
+      if (TREE_NAMES.test(name)) add(features.tree, centre._x, centre._z);
+      else if (ROCK_NAMES.test(name)) add(features.rock, centre._x, centre._z);
+      else if (BUILDING_TEXTURES.has(appearance._materialFileName) && !entity._tileLength && appearance._rotation) {
+        // A wall: tiles along its line.
+        const yaw = appearance._rotation._y, along = [Math.cos(yaw), -Math.sin(yaw)];
+        for (let t = -entity._width / 2; t <= entity._width / 2; t += 0.5) add(features.building, centre._x + along[0] * t, centre._z + along[1] * t);
+      } else continue;
+      features.count++;
+    }
+    return { tree: [...features.tree], rock: [...features.rock], building: [...features.building], count: features.count };
+  }
+
+  // Objects often finish loading after the ground: rebuild it once they do.
+  refreshGroundForFeatures() {
+    if (!this.osrsGround || !this.groundMesh || this.buildingGround) return;
+    let count = 0;
+    for (const entity of this.gameHooks.WorldEntityManager?.Instance?.WorldEntities?.values() ?? []) {
+      const name = entity._def?._name ?? "";
+      if (TREE_NAMES.test(name) || ROCK_NAMES.test(name) || (BUILDING_TEXTURES.has(entity._appearance?._materialFileName) && !entity._tileLength && entity._appearance?._rotation)) count++;
+    }
+    if (count === this.groundFeatureCount) return;
+    this.buildingGround = true;
+    this.buildGround(this.groundMesh)
+      .catch((error) => this.error("Building terrain failed", error))
+      .finally(() => (this.buildingGround = false));
   }
 
   removeOsrsGround() {

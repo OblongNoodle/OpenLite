@@ -11,7 +11,35 @@ import { CreatureModel, creatureFamilyFor, loadCreatureSpec } from "./models3d/c
 import { ITEM_SIZE, itemYaw, loadItemGeometry } from "./models3d/items.js";
 import { buildScenery, loadSceneryColors, sceneryKindFor } from "./models3d/scenery.js";
 import { OsrsCache, OsrsPlayerModel, buildNpcData, buildPlayerData, findNpc } from "./models3d/osrs/player.js";
+import { buildLoc, createLocMeshes, osrsTextureCanvas } from "./models3d/osrs/locs.js";
 import { ActionState } from "@highlite/core";
+
+// OSRS objects drawn for the game's scenery, by kind, and once used up (a
+// chopped tree's stump, a mined rock's bare stone). Ore rocks by their ore.
+// Rocks are OSRS boulders, varied between the two; ore rocks wear OSRS's
+// rock texture over their ore colour.
+const OSRS_SCENERY = { tree: 1276, stump: 1341, deadTree: 1286, bush: 1124, rock: [10790, 10791] };
+const ORE_ROCK_TEXTURE = 11;
+// Kinds sized to the original object (the game's trees and boulders are
+// bigger than OSRS's): trees stretched to its width and height, boulders
+// scaled evenly to fill its larger dimension. The rest keep the world's OSRS
+// scale.
+const FIT_TO_ORIGINAL = new Set(["tree", "deadTree", "rock"]);
+const FIT_EVENLY = new Set(["rock"]);
+const OSRS_ORE_ROCKS = { copper: 10943, tin: 11360, iron: 11364 };
+const OSRS_USED_UP = { tree: 1341, oreRock: 11390 };
+const USED_UP_STATE = 0;
+// OSRS figures are drawn larger to match the game's; scenery is scaled alike.
+const OSRS_WORLD_SCALE = 1.2;
+const NEAREST_SAMPLING = 1;
+
+// The OSRS object for a piece of scenery; `seed` picks between variants.
+function osrsSceneryObject(kind, name, state, seed) {
+  if (state === USED_UP_STATE && OSRS_USED_UP[kind]) return OSRS_USED_UP[kind];
+  if (kind === "oreRock") return OSRS_ORE_ROCKS[/copper|tin|iron/i.exec(name)?.[0].toLowerCase()] ?? OSRS_USED_UP.oreRock;
+  const choice = OSRS_SCENERY[kind];
+  return Array.isArray(choice) ? choice[seed % choice.length] : choice ?? null;
+}
 
 // Model specs are cached per sprite so identical NPCs share one analysis.
 const MAX_CACHED_SPECS = 256;
@@ -80,6 +108,7 @@ var Models3D = class extends Plugin {
     this.sceneryRecords ??= new Map();
     this.settings.scenery ??= { text: "3D trees, rocks and bushes", type: SettingsTypes.checkbox, value: true, callback: () => {} };
     this.settings.osrsCharacters ??= { text: "OSRS character models (needs RuneLite's OSRS cache)", type: SettingsTypes.checkbox, value: true, callback: () => {} };
+    this.settings.osrsScenery ??= { text: "OSRS trees and rocks (from your OSRS cache)", type: SettingsTypes.checkbox, value: true, callback: () => this.clearScenery() };
     // Players are built from the local OSRS cache when it is available.
     this.osrsCache = OsrsCache.open().catch((error) => {
       this.warn("OSRS cache not available; using generated characters", error);
@@ -104,6 +133,11 @@ var Models3D = class extends Plugin {
       this[key]?.dispose();
       this[key] = null;
     }
+    for (const prototype of this.locPrototypes?.values() ?? []) prototype.then((mesh) => mesh?.dispose(false, true)).catch(() => {});
+    this.locPrototypes = null;
+    for (const material of this.locMaterials?.values() ?? []) material.then((m) => m?.dispose(true, true)).catch(() => {});
+    this.locMaterials = null;
+    this.readyLocMaterials = null;
   }
 
   get scene() {
@@ -236,7 +270,7 @@ var Models3D = class extends Plugin {
     const light = this.gameHooks.AtmosphereManager?.Instance?.HemisphericLight;
     if (!light) return;
     const level = (channel) => Math.min(1, Math.max(0.45, light.diffuse[channel] * light.intensity * 1.1));
-    for (const material of [this.material, this.translucentMaterial, this.osrsMaterial]) {
+    for (const material of [this.material, this.translucentMaterial, this.osrsMaterial, ...(this.readyLocMaterials ?? [])]) {
       material?.emissiveColor.set(level("r"), level("g"), level("b"));
     }
   }
@@ -419,6 +453,36 @@ var Models3D = class extends Plugin {
       min = min ? min.minimizeInPlace(box.minimumWorld) : box.minimumWorld.clone();
       max = max ? max.maximizeInPlace(box.maximumWorld) : box.maximumWorld.clone();
     }
+    const x = (min.x + max.x) / 2, z = (min.z + max.z) / 2;
+    const seed = Math.abs(Math.floor(x) * 7 + Math.floor(z) * 13);
+    const objectId = this.settings.osrsScenery.value && window.osrsCache ? osrsSceneryObject(record.kind, record.entity._def?._name ?? "", state, seed) : null;
+    if (objectId !== null) {
+      // The OSRS object at the original's spot, turned a quarter turn per
+      // tile for variety (as OSRS maps vary them): at the world's OSRS scale,
+      // or stretched to fill the original's space.
+      record.state = state;
+      const fit = FIT_TO_ORIGINAL.has(record.kind) && state !== USED_UP_STATE;
+      this.osrsLocMesh(objectId, record.kind === "oreRock" ? ORE_ROCK_TEXTURE : null).then((prototype) => {
+        if (!prototype || record.state !== state || this.sceneryRecords.get(record.entity) !== record) return;
+        record.mesh?.dispose();
+        const mesh = prototype.clone(`models3d-scenery-${record.entity.EntityID}`);
+        mesh.setEnabled(true);
+        mesh.position.set(x, min.y, z);
+        mesh.rotation.y = (seed % 4) * (Math.PI / 2);
+        const size = prototype.metadata?.size;
+        if (fit && size) {
+          // Turned by quarter turns, so the wider side fits the wider side.
+          const across = Math.max(max.x - min.x, max.z - min.z) / Math.max(size.width, size.depth, 0.01);
+          const up = (max.y - min.y) / Math.max(size.height, 0.01);
+          if (FIT_EVENLY.has(record.kind)) mesh.scaling.setAll(Math.max(across, up));
+          else mesh.scaling.set(across, up, across);
+        } else {
+          mesh.scaling.setAll(OSRS_WORLD_SCALE);
+        }
+        record.mesh = mesh;
+      }).catch((error) => this.error("Building OSRS scenery failed", error));
+      return;
+    }
     record.mesh?.dispose();
     const geometry = buildScenery(record.kind, record.colors, record.entity.EntityID, state).bakeLighting();
     const mesh = geometry.applyTo(new this.ctors.Mesh(`models3d-scenery-${record.entity.EntityID}`, this.scene));
@@ -429,6 +493,47 @@ var Models3D = class extends Plugin {
     mesh.freezeWorldMatrix();
     record.mesh = mesh;
     record.state = state;
+  }
+
+  // A hidden prototype of an OSRS object's meshes (see models3d/osrs/locs.js);
+  // each tree or rock is a clone sharing its geometry.
+  osrsLocMesh(objectId, wrapTexture = null) {
+    this.locPrototypes ??= new Map();
+    const key = `${objectId}:${wrapTexture}`;
+    if (!this.locPrototypes.has(key)) {
+      this.locPrototypes.set(key, (async () => {
+        const cache = await OsrsCache.open();
+        const object = (await cache.objects()).get(objectId);
+        const data = object && (await buildLoc(cache, object, { wrapTexture }));
+        if (!data || !this.locPrototypes) return null;
+        const root = await createLocMeshes(this.ctors.Mesh, this.scene, data, this.getOsrsMaterial(), (id) => this.locTextureMaterial(id), `models3d-loc-${objectId}`);
+        root.setEnabled(false);
+        return root;
+      })());
+    }
+    return this.locPrototypes.get(key);
+  }
+
+  // Material for an OSRS texture: unlit like the other models (the light is
+  // in the vertex colours; the emissive colour follows the scene's light),
+  // two-sided, with see-through texels cut out (leaves).
+  locTextureMaterial(textureId) {
+    this.locMaterials ??= new Map();
+    this.readyLocMaterials ??= new Set();
+    if (!this.locMaterials.has(textureId)) {
+      this.locMaterials.set(textureId, (async () => {
+        const canvas = await osrsTextureCanvas(textureId);
+        const Texture = this.scene.textures.find((t) => t.getClassName() === "Texture")?.constructor;
+        if (!canvas || !Texture) return null;
+        const material = this.getMaterial().clone(`models3d-osrs-texture-${textureId}`);
+        material.backFaceCulling = false;
+        material.diffuseTexture = new Texture(canvas.toDataURL(), this.scene, false, true, NEAREST_SAMPLING);
+        material.diffuseTexture.hasAlpha = true;
+        this.readyLocMaterials?.add(material);
+        return material;
+      })());
+    }
+    return this.locMaterials.get(textureId);
   }
 
   disposeSceneryRecord(record) {
