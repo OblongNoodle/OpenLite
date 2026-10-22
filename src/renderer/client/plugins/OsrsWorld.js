@@ -6,7 +6,8 @@
 // - terrain: one crisp colour per tile and faceted (flat-shaded) hills;
 // - objects: textures baked into one flat colour per face, like OSRS models.
 import { Plugin, SettingsTypes } from "@highlite/core";
-import { buildOsrsGround, buildTerrainGeometry, readImage } from "./osrsworld/terrain.js";
+import { buildGroundRequest, buildTerrainGeometry, readImage } from "./osrsworld/terrain.js";
+import { GroundWorker } from "./osrsworld/groundWorker.js";
 import { osrsStyleTexture } from "./osrsworld/textures.js";
 import { MODEL_DEFAULT_TEXTURES, osrsTextureCanvas, osrsTextureForFile } from "./osrsworld/osrsTextures.js";
 import { OsrsFences } from "./osrsworld/fences.js";
@@ -23,6 +24,10 @@ const BILINEAR_SAMPLING = 2;
 const MAX_BAKE_TRANSPARENCY = 0.25;
 // How often to look for newly loaded objects (new map regions) to bake.
 const BAKE_SCAN_INTERVAL_MS = 1000;
+// How long newly added meshes are watched for materials to restyle at once.
+const NEW_MESH_WATCH_MS = 3000;
+// Work spread over frames takes at most this long per frame.
+const FRAME_BUDGET_MS = 6;
 // How often to check for fences that loaded or unloaded.
 const FENCE_UPDATE_INTERVAL_MS = 500;
 // How often frozen meshes' culling boxes are checked (see repairCullingBoxes).
@@ -175,6 +180,14 @@ var OsrsWorld = class extends Plugin {
     this.bakeInProgress = false;
     // Retextured materials: material -> original texture.
     this.retextured = new Map();
+    // Restyled textures by source (see textureKey), shared by every material
+    // made from that source in every map region: key -> Promise<Texture>, and
+    // the ones that have loaded.
+    this.textureCache = new Map();
+    this.readyTextures = new Map();
+    // Meshes added recently, given cached textures before they are first
+    // drawn (see retextureNewMeshesNow): mesh -> time added.
+    this.newMeshes = new Map();
     this.facetedMeshes = new WeakSet();
   }
 
@@ -209,6 +222,8 @@ var OsrsWorld = class extends Plugin {
     this.removeOsrsGround();
     if (this.groundMesh) this.setGroundSampling(this.groundMesh, BILINEAR_SAMPLING);
     this.groundMesh = null;
+    this.groundWorker?.terminate();
+    this.groundWorker = null;
   }
 
   get scene() {
@@ -227,6 +242,12 @@ var OsrsWorld = class extends Plugin {
       setTimeout(() => this.settings.enable.value && this.attachRenderObserver(), 500);
       return;
     }
+    // New objects are restyled as soon as they arrive (see renderFrame).
+    this.newMeshObserver = scene.onNewMeshAddedObservable.add((mesh) => {
+      this.newMeshes?.set(mesh, performance.now());
+      this.lastBakeScan = 0;
+      this.sceneryDirty = true;
+    });
     this.observer = scene.onBeforeRenderObservable.add(() => {
       try {
         this.renderFrame(scene);
@@ -238,11 +259,14 @@ var OsrsWorld = class extends Plugin {
 
   detachRenderObserver() {
     if (this.observer && this.scene) this.scene.onBeforeRenderObservable.remove(this.observer);
+    if (this.newMeshObserver && this.scene) this.scene.onNewMeshAddedObservable.remove(this.newMeshObserver);
     this.observer = null;
+    this.newMeshObserver = null;
   }
 
   renderFrame(scene) {
     this.updateGround(scene);
+    if (this.settings.osrsTextures.value) this.retextureNewMeshesNow();
     const objectMode = this.settings.osrsTextures.value ? "retexture" : this.settings.flatObjects.value ? "bake" : null;
     if (objectMode && !this.bakeInProgress && performance.now() - this.lastBakeScan > BAKE_SCAN_INTERVAL_MS) {
       this.lastBakeScan = performance.now();
@@ -333,9 +357,16 @@ var OsrsWorld = class extends Plugin {
     if (!this.settings.osrsFences.value || !window.osrsCache) return;
     const material = this.sceneryMaterial(scene);
     if (!material) return;
-    if (performance.now() - (this.lastFenceUpdate ?? 0) < FENCE_UPDATE_INTERVAL_MS) return;
-    this.lastFenceUpdate = performance.now();
-    if (this.settings.osrsTerrain.value) this.refreshGroundForFeatures();
+    // Right after new objects arrive (so the game's versions never show), and
+    // every so often anyway; the ground's re-tint only on the timer.
+    const now = performance.now();
+    const due = now - (this.lastFenceUpdate ?? 0) >= FENCE_UPDATE_INTERVAL_MS;
+    if (!due && !this.sceneryDirty) return;
+    this.sceneryDirty = false;
+    if (due) {
+      this.lastFenceUpdate = now;
+      if (this.settings.osrsTerrain.value) this.refreshGroundForFeatures();
+    }
     this.fences ??= new OsrsFences(scene, () => this.gameHooks.WorldEntityManager?.Instance?.WorldEntities);
     this.fences.update(material).catch((error) => this.error("Building OSRS fences failed", error));
     if (this.settings.hideDecorativePlants.value) this.hideDecorativePlants(scene);
@@ -427,7 +458,12 @@ var OsrsWorld = class extends Plugin {
 
   // Gives every newly loaded object OSRS-style textures and faceted shading.
   async retextureNewObjects(scene) {
+    let sliceStart = performance.now();
     for (const mesh of [...scene.meshes]) {
+      if (performance.now() - sliceStart > FRAME_BUDGET_MS) {
+        await new Promise((resolve) => requestAnimationFrame(resolve));
+        sliceStart = performance.now();
+      }
       const source = mesh.sourceMesh ?? mesh;
       let touched = false;
       for (const material of this.objectMaterials(source)) {
@@ -446,23 +482,75 @@ var OsrsWorld = class extends Plugin {
   async retexture(material, mesh) {
     const original = material.diffuseTexture;
     this.retextured.set(material, original);
-    // Textures with an OSRS counterpart use the real one from the player's
-    // OSRS cache; the rest are restyled.
-    let canvas = await osrsTextureForFile(this.textureFileOf(material, mesh));
-    if (material.diffuseTexture !== original) return;
+    const file = this.textureFileOf(material, mesh);
+    const key = this.textureKey(original, file);
+    if (!this.textureCache.has(key)) {
+      this.textureCache.set(key, this.restyledTexture(original, file, material.getScene()).then((texture) => {
+        if (texture) this.readyTextures.set(key, texture);
+        return texture;
+      }));
+    }
+    const texture = await this.textureCache.get(key);
+    if (!texture || material.diffuseTexture !== original) return;
+    material.unfreeze?.();
+    material.diffuseTexture = texture;
+  }
+
+  // What a restyled texture depends on: the game texture it replaces and how
+  // that is sampled.
+  textureKey(original, file) {
+    return `${file ?? original.name ?? original.url}|${original._invertY}|${original.hasAlpha}|${original.wrapU}|${original.wrapV}`;
+  }
+
+  // Textures with an OSRS counterpart use the real one from the player's OSRS
+  // cache; the rest are restyled. Resolves once the texture has loaded, so a
+  // material keeps its original until then rather than drawing nothing.
+  async restyledTexture(original, file, scene) {
+    let canvas = await osrsTextureForFile(file);
     if (!canvas) {
       const { width, height } = original.getSize();
       const pixels = await original.readPixels();
-      if (!pixels || material.diffuseTexture !== original) return;
+      if (!pixels) return null;
       canvas = osrsStyleTexture(pixels, width, height);
     }
     const Texture = original.constructor;
-    const texture = new Texture(canvas.toDataURL(), material.getScene(), false, original._invertY ?? true, NEAREST_SAMPLING);
-    texture.hasAlpha = original.hasAlpha;
-    texture.wrapU = original.wrapU;
-    texture.wrapV = original.wrapV;
-    material.unfreeze?.();
-    material.diffuseTexture = texture;
+    return new Promise((resolve) => {
+      const texture = new Texture(canvas.toDataURL(), scene, false, original._invertY ?? true, NEAREST_SAMPLING, () => {
+        texture.hasAlpha = original.hasAlpha;
+        texture.wrapU = original.wrapU;
+        texture.wrapV = original.wrapV;
+        resolve(texture);
+      }, () => resolve(null));
+    });
+  }
+
+  // Newly added objects whose restyled textures are already made get them
+  // right away, before they are first drawn (no flash of the game's own
+  // textures when a map region loads). Objects get their materials soon after
+  // being added, so they are watched for a moment.
+  retextureNewMeshesNow() {
+    const now = performance.now();
+    for (const [mesh, added] of this.newMeshes) {
+      if (mesh.isDisposed() || now - added > NEW_MESH_WATCH_MS) {
+        this.newMeshes.delete(mesh);
+        continue;
+      }
+      const source = mesh.sourceMesh ?? mesh;
+      let pending = false;
+      for (const material of this.objectMaterials(source)) {
+        if (this.retextured.has(material)) continue;
+        const original = material.diffuseTexture;
+        const texture = original && this.readyTextures.get(this.textureKey(original, this.textureFileOf(material, source)));
+        if (!texture) {
+          pending = true;
+          continue;
+        }
+        this.retextured.set(material, original);
+        material.unfreeze?.();
+        material.diffuseTexture = texture;
+      }
+      if (!pending && source.material) this.newMeshes.delete(mesh);
+    }
   }
 
   // The game texture a world object's material was made from ("15.png").
@@ -482,12 +570,11 @@ var OsrsWorld = class extends Plugin {
   }
 
   restoreTextures() {
-    for (const [material, original] of this.retextured) {
-      const current = material.diffuseTexture;
-      material.diffuseTexture = original;
-      if (current && current !== original) current.dispose();
-    }
+    for (const [material, original] of this.retextured) material.diffuseTexture = original;
     this.retextured.clear();
+    for (const texture of this.readyTextures.values()) texture.dispose();
+    this.readyTextures.clear();
+    this.textureCache.clear();
   }
 
   // Static meshes have frozen world matrices; after their geometry changes the
@@ -551,8 +638,11 @@ var OsrsWorld = class extends Plugin {
 
     const ground = scene.getMeshByName(GROUND_MESH_NAME);
     if (!ground || ground === this.groundMesh) return;
-    this.removeOsrsGround();
+    // A new region: our ground for the last one stays on screen until this
+    // one's is built, and the game's own ground is never shown meanwhile.
     this.groundMesh = ground;
+    if (this.osrsGround && this.settings.osrsTerrain.value) ground.isVisible = false;
+    else this.removeOsrsGround();
     this.upgradeGroundGeometry(ground)
       .catch((error) => this.error("Rebuilding terrain failed", error))
       .finally(() => {
@@ -589,7 +679,11 @@ var OsrsWorld = class extends Plugin {
   refreshGround() {
     if (!this.groundMesh) return;
     if (this.settings.osrsTerrain.value) {
-      this.buildGround(this.groundMesh).catch((error) => this.error("Building terrain failed", error));
+      this.buildGround(this.groundMesh).catch((error) => {
+        this.error("Building terrain failed", error);
+        // Show the game's ground rather than none.
+        this.removeOsrsGround();
+      });
     } else {
       this.removeOsrsGround();
       this.applyGroundSampling();
@@ -606,23 +700,32 @@ var OsrsWorld = class extends Plugin {
     if (ground !== this.groundMesh || ground.isDisposed() || !this.settings.osrsTerrain.value) return;
     const material = this.sceneryMaterial(ground.getScene());
     if (!material) return;
-    // Tile corners sit on the game ground's own vertices (one row per
-    // subdivision, the first row at the image's top), so heights match.
+    // Tile corners sit on the game ground's own vertices (see terrain.js
+    // groundCorners), so heights match.
     const vertices = ground.getVerticesData("position");
     const subdivisions = ground._subdivisionsX ?? map._groundMeshOptions.subdivisions;
     const options = map._groundMeshOptions;
-    const cornerPosition = (cx, cy) => {
-      const col = Math.round((cx / colors.width) * subdivisions), row = Math.round((cy / colors.height) * subdivisions);
-      const y = vertices[(row * (subdivisions + 1) + col) * 3 + 1];
-      return [(cx / colors.width) * options.width - options.width / 2, y, options.height / 2 - (cy / colors.height) * options.height];
-    };
     // World tile of corner 0, 0 (the image's top-left), for the height noise.
     const worldOrigin = { x: Math.round(ground.position.x - options.width / 2), y: Math.round(-(ground.position.z + options.height / 2)) };
     const water = ground.getScene().getMeshByName(WATER_MESH_NAME);
     const waterLevel = water ? water.position.y - ground.position.y : null;
     const features = this.groundFeatures(colors, worldOrigin, ground, options);
     this.groundFeatureCount = features.count;
-    const data = buildOsrsGround(colors, cornerPosition, worldOrigin, this.settings.tileVisibility.value / 10, waterLevel, features);
+    // Made on a worker thread (the work is too much for one frame).
+    const request = {
+      colors, vertices: Float32Array.from(vertices), subdivisions, groundWidth: options.width, groundHeight: options.height,
+      worldOrigin, tileVisibility: this.settings.tileVisibility.value / 10, waterLevel,
+      features: { tree: features.tree, rock: features.rock, building: features.building }
+    };
+    let data;
+    try {
+      this.groundWorker ??= new GroundWorker();
+      data = await this.groundWorker.build(request);
+    } catch (error) {
+      this.warn("Ground worker unavailable; building on the main thread", error);
+      data = buildGroundRequest(request);
+    }
+    if (ground !== this.groundMesh || ground.isDisposed() || !this.settings.osrsTerrain.value) return;
     const Mesh = this.scene.meshes.find((m) => m.getClassName() === "Mesh").constructor;
     const osrsGround = new Mesh(OSRS_GROUND_NAME, ground.getScene());
     osrsGround.setVerticesData("position", data.positions, false);
@@ -630,7 +733,14 @@ var OsrsWorld = class extends Plugin {
     osrsGround.setIndices(data.indices);
     osrsGround.material = material;
     osrsGround.isPickable = false;
+    // Placed where the game's ground is but not attached to it: when a new
+    // region loads, the game replaces its ground at once, and ours stays on
+    // screen until the new region's is ready (see updateGround).
+    ground.computeWorldMatrix(true);
     osrsGround.parent = ground;
+    osrsGround.computeWorldMatrix(true);
+    osrsGround.setParent(null);
+    osrsGround.freezeWorldMatrix();
     // Stone paving, textured; it hangs off our ground, so it goes with it.
     await this.texturedGround(osrsGround, data.textured);
     if (ground !== this.groundMesh || ground.isDisposed()) {
@@ -895,6 +1005,14 @@ var OsrsWorld = class extends Plugin {
       light.intensity = this.saved.lightIntensity;
     }
     this.saved = null;
+    // What we saved was the overworld's sky at the time; on another map level
+    // (a cave) or later in the day the game's own is different, so have the
+    // game apply its current one.
+    try {
+      this.atmosphere?._skyColors?.[this.atmosphere._currentMapLevel]?._forceSetWeather?.();
+    } catch (error) {
+      this.error("Reapplying the game's atmosphere failed", error);
+    }
   }
 
   restoreIfDisabled() {

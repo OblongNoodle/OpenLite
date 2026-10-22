@@ -44,6 +44,9 @@ export class OsrsFences {
   async update(material) {
     if (this.building) return;
     const walls = this.fenceWalls();
+    // Hidden before ours are built: a moment without a new fence beats a
+    // flash of the game's.
+    this.hideGameFences(walls);
     const key = [...walls.keys()].sort((a, b) => a - b).join(",");
     if (key !== this.key) {
       this.building = true;

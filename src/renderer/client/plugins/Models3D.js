@@ -14,6 +14,7 @@ import { OsrsCache, OsrsPlayerModel, buildNpcData, buildPlayerData, findNpc } fr
 import { buildLoc, createLocMeshes, osrsTextureCanvas } from "./models3d/osrs/locs.js";
 import { findOsrsItem, osrsItemIcon, osrsItemModel } from "./models3d/osrs/itemIcons.js";
 import { osrsNameCandidates } from "./models3d/osrs/itemNames.js";
+import { attachClickProxies, installClickPredicate, releaseClickMeshes, uninstallClickPredicate } from "./models3d/clickProxies.js";
 import { ActionState } from "@highlite/core";
 
 // OSRS objects drawn for the game's scenery, by kind, and once used up (a
@@ -174,6 +175,7 @@ var Models3D = class extends Plugin {
     this.clearGroundItems();
     this.clearScenery();
     this.clearFurniture();
+    uninstallClickPredicate(this.gameHooks.GameEngine?.Instance);
     this.restoreItemIcons();
     // Specs are cheap to rebuild and may come from older code after a hot swap.
     this.specCache.clear();
@@ -413,6 +415,9 @@ var Models3D = class extends Plugin {
     this.renderGroundItems();
     this.renderScenery();
     this.renderFurniture();
+    // OSRS scenery and furniture are clicked by their own shapes (see
+    // models3d/clickProxies.js).
+    installClickPredicate(this.gameHooks.GameEngine?.Instance);
     this.updateItemIcons();
 
     for (const exhibit of this.gallery ?? []) {
@@ -571,10 +576,12 @@ var Models3D = class extends Plugin {
           mesh.scaling.setAll(OSRS_WORLD_SCALE);
         }
         record.mesh = mesh;
+        attachClickProxies(this.ctors.Mesh, mesh, record.appearance.BJSMeshes);
       }).catch((error) => this.error("Building OSRS scenery failed", error));
       return;
     }
     record.mesh?.dispose();
+    releaseClickMeshes(record.appearance.BJSMeshes);
     const geometry = buildScenery(record.kind, record.colors, record.entity.EntityID, state).bakeLighting();
     const mesh = geometry.applyTo(new this.ctors.Mesh(`models3d-scenery-${record.entity.EntityID}`, this.scene));
     mesh.material = this.getMaterial();
@@ -731,6 +738,7 @@ var Models3D = class extends Plugin {
   disposeSceneryRecord(record) {
     record.mesh?.dispose();
     record.mesh = null;
+    releaseClickMeshes(record.appearance.BJSMeshes);
     if (!record.entity.IsDestroyed) for (const mesh of record.appearance.BJSMeshes ?? []) (mesh.sourceMesh ?? mesh).visibility = 1;
   }
 
@@ -755,13 +763,22 @@ var Models3D = class extends Plugin {
         if (this.furnitureRecords.has(entity)) continue;
         const record = { entity, meshes, mesh: null };
         this.furnitureRecords.set(entity, record);
+        // Hidden at once, so the game's model never shows while the OSRS one
+        // is made (instances draw with their source mesh's visibility, so the
+        // source is hidden; every copy of that object gets a replacement).
+        const setOriginalsVisible = (visible) => {
+          for (const mesh of meshes) (mesh.sourceMesh ?? mesh).visibility = visible ? 1 : 0;
+        };
+        setOriginalsVisible(false);
         this.osrsLocMesh(objectId).then((prototype) => {
-          if (!prototype || this.furnitureRecords?.get(entity) !== record) return;
-          record.mesh = this.placeFurniture(prototype, meshes, appearance, entity.EntityID ?? entity._entityId, osrsFurnitureFacing(entity));
-          // Instances draw with their source mesh's visibility, so hide the
-          // source (every copy of that object gets a replacement anyway).
-          if (record.mesh) for (const mesh of meshes) (mesh.sourceMesh ?? mesh).visibility = 0;
-        }).catch((error) => this.error("Building OSRS furniture failed", error));
+          if (this.furnitureRecords?.get(entity) !== record) return;
+          record.mesh = prototype && this.placeFurniture(prototype, meshes, appearance, entity.EntityID ?? entity._entityId, osrsFurnitureFacing(entity));
+          if (record.mesh) attachClickProxies(this.ctors.Mesh, record.mesh, meshes);
+          else setOriginalsVisible(true);
+        }).catch((error) => {
+          setOriginalsVisible(true);
+          this.error("Building OSRS furniture failed", error);
+        });
       }
     }
     for (const [entity, record] of this.furnitureRecords) {
@@ -808,6 +825,7 @@ var Models3D = class extends Plugin {
   disposeFurnitureRecord(record) {
     record.mesh?.dispose();
     record.mesh = null;
+    releaseClickMeshes(record.meshes);
     if (!record.entity._isDestroyed) for (const mesh of record.meshes ?? []) (mesh.sourceMesh ?? mesh).visibility = 1;
   }
 

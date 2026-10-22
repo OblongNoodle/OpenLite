@@ -329,6 +329,31 @@ export async function buildTerrainGeometry(heightMapUrl, size, subdivisions, min
   return { positions, uvs, indices };
 }
 
+// Where each corner of the colour image's tiles sits, in the ground's space:
+// on the game ground's own vertices (one row per subdivision, the first row
+// at the image's top), so heights match.
+export function groundCorners(vertices, subdivisions, groundWidth, groundHeight, imageWidth, imageHeight) {
+  return (cx, cy) => {
+    const col = Math.round((cx / imageWidth) * subdivisions), row = Math.round((cy / imageHeight) * subdivisions);
+    const y = vertices[(row * (subdivisions + 1) + col) * 3 + 1];
+    return [(cx / imageWidth) * groundWidth - groundWidth / 2, y, groundHeight / 2 - (cy / imageHeight) * groundHeight];
+  };
+}
+
+// buildOsrsGround from plain data (what a worker is sent; see
+// osrsworld/groundWorker.js), with typed arrays ready for the mesh.
+export function buildGroundRequest({ colors, vertices, subdivisions, groundWidth, groundHeight, worldOrigin, tileVisibility, waterLevel, features }) {
+  const cornerPosition = groundCorners(vertices, subdivisions, groundWidth, groundHeight, colors.width, colors.height);
+  const data = buildOsrsGround(colors, cornerPosition, worldOrigin, tileVisibility, waterLevel, features);
+  const pack = (part) => ({
+    positions: new Float32Array(part.positions),
+    colors: new Float32Array(part.colors),
+    indices: new Uint32Array(part.indices),
+    ...(part.uvs && { uvs: new Float32Array(part.uvs) })
+  });
+  return { ...pack(data), textured: { ...pack(data.textured), textureId: data.textured.textureId } };
+}
+
 // Blends tile colours the client's way: an average in HSL over the tiles
 // within `radius` that `include` accepts, hue weighted by chroma. Returns
 // [h, s, l] per tile (or null where nothing was included).
