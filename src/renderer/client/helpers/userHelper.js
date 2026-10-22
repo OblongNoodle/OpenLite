@@ -26,6 +26,25 @@
 
 import { setTitle } from '../helpers/titlebarHelpers.js';
 
+// The account last logged in with (preselected next time), and whether
+// "Remember Me" is on (on unless turned off).
+const LAST_USERNAME_KEY = 'openlite-last-username';
+const REMEMBER_ME_KEY = 'openlite-remember-me';
+
+function readSetting(key) {
+    try {
+        return localStorage.getItem(key);
+    } catch {
+        return null;
+    }
+}
+
+function writeSetting(key, value) {
+    try {
+        localStorage.setItem(key, value);
+    } catch {}
+}
+
 let doOncePerLoginScreen = true;
 export function createUserHelper() {
     // Setup mutation observer on document to wait for #login-menu-username to be available
@@ -63,23 +82,22 @@ function setupUserHelper() {
         rememberMeLabel.textContent = 'Remember Me';
         rememberMeLabel.setAttribute('for', 'rememberMeCheckbox');
 
+        const setRememberMe = checked => {
+            rememberMeCheckbox.classList.toggle(
+                'login-menu-checkbox-button__checked',
+                checked
+            );
+            rememberMeCheckbox.textContent = checked ? '✓' : '';
+        };
+        setRememberMe(readSetting(REMEMBER_ME_KEY) !== 'false');
+
         // Add click event to toggle the checkbox state
         rememberMeCheckbox.addEventListener('click', function () {
-            if (
-                rememberMeCheckbox.classList.contains(
-                    'login-menu-checkbox-button__checked'
-                )
-            ) {
-                rememberMeCheckbox.classList.remove(
-                    'login-menu-checkbox-button__checked'
-                );
-                rememberMeCheckbox.textContent = ''; // Remove checkmark when unchecked
-            } else {
-                rememberMeCheckbox.classList.add(
-                    'login-menu-checkbox-button__checked'
-                );
-                rememberMeCheckbox.textContent = '✓'; // Add checkmark when checked
-            }
+            const checked = !rememberMeCheckbox.classList.contains(
+                'login-menu-checkbox-button__checked'
+            );
+            setRememberMe(checked);
+            writeSetting(REMEMBER_ME_KEY, String(checked));
         });
 
         // Append the checkbox and label to the settings container
@@ -169,8 +187,14 @@ function setupUserHelper() {
                 const option = document.createElement('option');
                 option.value = username;
                 option.textContent = username;
-                usernameDropdown.appendChild(option);
+                usernameDropdown.insertBefore(option, otherOption);
             });
+            // Start on the account last logged in with.
+            const lastUsername = readSetting(LAST_USERNAME_KEY);
+            if (lastUsername && savedUsernames.includes(lastUsername)) {
+                usernameDropdown.value = lastUsername;
+                usernameDropdown.dispatchEvent(new Event('change'));
+            }
         });
 
     // Add an "Other" option for custom input
@@ -295,10 +319,13 @@ function setupUserHelper() {
                 }
             }
 
-            if (selectedUsername === 'other' && usernameInput.value !== '') {
-                setTitle(`OpenLite - ${usernameInput.value}`);
-            } else {
-                setTitle(`OpenLite - ${selectedUsername}`);
+            const loginUsername =
+                selectedUsername === 'other'
+                    ? usernameInput.value
+                    : selectedUsername;
+            if (loginUsername) {
+                setTitle(`OpenLite - ${loginUsername}`);
+                if (rememberMeChecked) writeSetting(LAST_USERNAME_KEY, loginUsername);
             }
 
             // Look for 'id' hs-screen-mask to exist trigger once
