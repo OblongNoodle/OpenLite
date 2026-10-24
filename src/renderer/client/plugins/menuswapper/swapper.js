@@ -1,5 +1,6 @@
 // RuneLite-style Menu Entry Swapper: choose which action a left-click does on
-// a given NPC, object or inventory item. Shift + right-click something and
+// a given NPC, object or inventory item. Shift + right-click something (on
+// OpenLite Mobile: long-press it with the Tag button on) and
 // pick "Swap <action>" to make that its left-click ("Reset swap" undoes it);
 // the swapped action also goes to the top of its right-click menu. With
 // "Shift-click drop" on, Shift + left-click drops an inventory item.
@@ -224,6 +225,12 @@ export class MenuEntrySwapper extends Plugin {
     }
   }
 
+  // Swaps are chosen while Shift is held, or (on OpenLite Mobile, with no
+  // Shift key) while its Tag button is on, as Object Markers' tags are.
+  choosingSwaps() {
+    return this.shiftHeld || !!window.openliteTagMode;
+  }
+
   // --- World targets --------------------------------------------------------
 
   reorderWorldActions(result) {
@@ -241,10 +248,10 @@ export class MenuEntrySwapper extends Plugin {
     result._mainActionAndEntity = entries[0];
   }
 
-  // While Shift is held, each NPC or object in the menu gets "Swap <action>"
+  // While choosing swaps, each NPC or object in the menu gets "Swap <action>"
   // entries for its other actions, and "Reset swap" if it has one.
   addWorldMenuItems(args, items, menuItems) {
-    if (!this.shiftHeld || !Array.isArray(items)) return;
+    if (!this.choosingSwaps() || !Array.isArray(items)) return;
     const entries = args[0]?._actionsAndEntities ?? [];
     const names = lookups().GameWorldActions;
     const seen = new Set();
@@ -335,10 +342,10 @@ export class MenuEntrySwapper extends Plugin {
     return index > 0 ? [list, index] : null;
   }
 
-  // While Shift is held, an inventory item's menu gets "Swap <action>"
+  // While choosing swaps, an inventory item's menu gets "Swap <action>"
   // entries for its other actions, and "Reset swap" if it has one.
   addItemMenuItems(args, items, menuItems) {
-    if (!this.shiftHeld || !Array.isArray(items)) return;
+    if (!this.choosingSwaps() || !Array.isArray(items)) return;
     const [, , item, slot, menu] = args;
     if (!item?.Def) return;
     const names = lookups().InventoryActions;
