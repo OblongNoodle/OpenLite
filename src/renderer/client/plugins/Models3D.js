@@ -10,11 +10,12 @@ import { DEFAULT_COLORS, HumanModel, humanoidCreatureFor, loadHumanSpec, loadHum
 import { CreatureModel, creatureFamilyFor, loadCreatureSpec } from "./models3d/creatures.js";
 import { ITEM_SIZE, itemYaw, loadItemGeometry } from "./models3d/items.js";
 import { buildScenery, loadSceneryColors, sceneryKindFor } from "./models3d/scenery.js";
-import { OsrsCache, OsrsPlayerModel, buildNpcData, buildPlayerData, findNpc } from "./models3d/osrs/player.js";
+import { OsrsCache, OsrsPlayerModel, buildNpcData, buildPlayerData, findNpc, heldItems } from "./models3d/osrs/player.js";
 import { buildLoc, createLocMeshes, osrsTextureCanvas } from "./models3d/osrs/locs.js";
 import { findOsrsItem, osrsItemIcon, osrsItemModel } from "./models3d/osrs/itemIcons.js";
 import { osrsNameCandidates } from "./models3d/osrs/itemNames.js";
 import { attachBoxClickProxy, attachClickProxies, installClickPredicate, releaseClickMeshes, uninstallClickPredicate } from "./models3d/clickProxies.js";
+import { SIGN_BOARDS, addSignText, signTextCanvas } from "./models3d/signs.js";
 import { ActionState } from "@highlite/core";
 
 // OSRS objects drawn for the game's scenery, by kind, and once used up (a
@@ -57,9 +58,20 @@ const OSRS_FURNITURE_BY_MODEL = {
   "gravestone1.obj": 404, // GRAVESTONE1
   "gravestone2.obj": 405, // GRAVESTONE2
   "haystack1.obj": 298, // HAYSTACK
-  "door1.obj": 1535 // DOOR (wooden)
+  "door1.obj": 1535, // DOOR (wooden)
+  "ladder2.obj": 16683, // LADDER (a full one)
+  "ladder1.obj": 16684, // LADDER (the top of one, coming up through a floor)
+  "bed1.obj": 417, // BED
+  "doublebed1.obj": 417, // BED, made wider
+  "sign2.obj": 2286, // shop sign, hanging from a bracket (lettered; see models3d/signs.js)
+  "sign1.obj": 2366, // sign on a post (lettered)
+  "sign3.obj": 1079 // SIGNPOST (directions; read by inspecting it)
 };
-const OSRS_FURNITURE_BY_NAME = { Crate: 354 }; // CRATE2
+// By name, ahead of the model: bank chests share the plain chest's model.
+const OSRS_FURNITURE_BY_NAME = {
+  Crate: 354, // CRATE2
+  "Bank Chest": 16695 // an open chest of gold
+};
 // Crops, by the game object's name (the game draws them all as one flat
 // plant model): OSRS's own, a variant picked per spot. They stand at OSRS's
 // scale, turned a quarter turn per spot, and vanish while picked clean.
@@ -83,12 +95,15 @@ const OSRS_SMALL_TABLE = 602; // TABLE
 // How far each OSRS model is turned from the game model it replaces (their
 // fronts differ), by the game's model file.
 const FURNITURE_FACING = { "stove1.obj": Math.PI, "door1.obj": Math.PI / 2 };
+// ...and by name, for objects replaced by name (bank chests open toward the
+// room).
+const FURNITURE_FACING_BY_NAME = { "Bank Chest": Math.PI };
 // How far one axis may stretch (or squeeze) past the height's scale when
 // fitting.
 const FURNITURE_MAX_STRETCH = 1.6;
 
 function osrsFurnitureFacing(entity) {
-  return FURNITURE_FACING[String(entity._appearance?._meshFileName ?? "").split("%")[0]] ?? 0;
+  return FURNITURE_FACING_BY_NAME[entity._def?._name] ?? FURNITURE_FACING[String(entity._appearance?._meshFileName ?? "").split("%")[0]] ?? 0;
 }
 
 // A number fixed for an object's spot, for picking variants and turns.
@@ -106,7 +121,7 @@ function osrsFurnitureObject(entity) {
   if (crop) return crop[spotSeed(entity) % crop.length];
   const model = String(entity._appearance?._meshFileName ?? "").split("%")[0];
   if (model === "table1.obj") return Math.max(entity._width ?? 1, entity._length ?? 1) >= 1.5 ? OSRS_LONG_TABLE : OSRS_SMALL_TABLE;
-  return OSRS_FURNITURE_BY_MODEL[model] ?? OSRS_FURNITURE_BY_NAME[entity._def?._name] ?? null;
+  return OSRS_FURNITURE_BY_NAME[entity._def?._name] ?? OSRS_FURNITURE_BY_MODEL[model] ?? null;
 }
 
 // The OSRS object for a piece of scenery; `seed` picks between variants.
@@ -116,6 +131,10 @@ function osrsSceneryObject(kind, name, state, seed) {
   const choice = OSRS_SCENERY[kind];
   return Array.isArray(choice) ? choice[seed % choice.length] : choice ?? null;
 }
+
+// NPCs (by name) whose OSRS stand-in is given the weapon and shield the
+// game's character holds.
+const NPCS_GIVEN_HELD_ITEMS = new Set(["orlando"]);
 
 // Model specs are cached per sprite so identical NPCs share one analysis.
 const MAX_CACHED_SPECS = 256;
@@ -814,6 +833,7 @@ var Models3D = class extends Plugin {
             // thin to hit when zoomed out.
             if (crop) attachBoxClickProxy(this.ctors.Mesh, record.mesh, meshes, CROP_CLICK_WIDTH);
             else attachClickProxies(this.ctors.Mesh, record.mesh, meshes);
+            this.letterSign(record, objectId);
             record.shown = true;
             if (crop) this.updateCropShown(record);
           } else {
@@ -893,7 +913,29 @@ var Models3D = class extends Plugin {
     return mesh;
   }
 
+  // A sign's board gets what the sign says (its inspect text) painted on.
+  letterSign(record, objectId) {
+    const board = SIGN_BOARDS[objectId];
+    const text = record.entity._description;
+    const Texture = this.scene.textures.find((t) => t.getClassName() === "Texture")?.constructor;
+    if (!board || !text || !Texture) return;
+    const material = this.getMaterial().clone(`models3d-sign-${record.entity._entityTypeId ?? ""}`);
+    material.diffuseTexture = new Texture(signTextCanvas(text, board).toDataURL(), this.scene, false, true);
+    material.diffuseTexture.hasAlpha = true;
+    // Dims with the light like the other OSRS models (updateMaterialBrightness).
+    this.readyLocMaterials ??= new Set();
+    this.readyLocMaterials.add(material);
+    record.signMaterial = material;
+    addSignText(this.ctors.Mesh, record.mesh, board, material);
+  }
+
   disposeFurnitureRecord(record) {
+    if (record.signMaterial) {
+      this.readyLocMaterials?.delete(record.signMaterial);
+      record.signMaterial.diffuseTexture?.dispose();
+      record.signMaterial.dispose();
+      record.signMaterial = null;
+    }
     record.mesh?.dispose();
     record.mesh = null;
     releaseClickMeshes(record.meshes);
@@ -1030,7 +1072,12 @@ var Models3D = class extends Plugin {
       const isPlayer = record.entity.EntityType === PLAYER_ENTITY_TYPE;
       const npc = isPlayer ? null : findNpc(cache, record.entity.Name);
       let data = null;
-      if (npc) data = await buildNpcData(cache, npc);
+      // Some OSRS stand-ins hold nothing where the game's character holds
+      // something (Orlando's bow): they're given its weapon and shield.
+      const held = npc && record.spec?.gear && NPCS_GIVEN_HELD_ITEMS.has(String(record.entity.Name ?? "").toLowerCase())
+        ? heldItems(cache, await this.osrsGear(record.spec.gear))
+        : [];
+      if (npc) data = await buildNpcData(cache, npc, held);
       else if (record.type.kind === "human" && record.spec) data = await buildPlayerData(cache, record.spec.appearanceIds, record.spec.colors, await this.osrsGear(record.spec.gear));
       if (!data) return;
       if (record.specKey !== key || this.records.get(record.entity) !== record) return;

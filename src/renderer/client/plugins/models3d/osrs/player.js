@@ -64,6 +64,7 @@ const WEAPON_COMBAT = [
 const PICKAXE_COMBAT = { attack: 401, block: 403 };
 // The game's equipment slot that holds the weapon.
 const WEAPON_SLOT = 4;
+const SHIELD_SLOT = 3;
 
 function weaponCombat(name) {
   if (!name) return HUMAN_COMBAT;
@@ -496,7 +497,8 @@ const NPC_ALIASES = [
   [/^nisse$/, "gnome"],
   [/^shop owner$/, "shop keeper"],
   [/^knight$/, "white knight"],
-  [/^wandering monk$/, "monk"]
+  [/^wandering monk$/, "monk"],
+  [/^orlando$/, "orlando smith"] // Varrock Museum's guide
 ];
 
 // The OSRS NPC for a HighSpell NPC name: the same name, or a close stand-in.
@@ -510,13 +512,36 @@ export function findNpc(cache, name) {
   return null;
 }
 
+// The OSRS items for what a character holds in its hands (`gear` as the game
+// gives it, item names as OSRS names them): weapon and shield.
+export function heldItems(cache, gear) {
+  return [WEAPON_SLOT, SHIELD_SLOT].map((slot) => findItem(cache, gear?.[slot]?.name)).filter(Boolean);
+}
+
 // The merged, recoloured, scaled and lit mesh data for an OSRS NPC, as the
-// client's NpcType.getBodyModel builds it.
-export async function buildNpcData(cache, npc) {
+// client's NpcType.getBodyModel builds it; `held` (OSRS items) are put in its
+// hands as worn by players (human NPCs share the player skeleton).
+export async function buildNpcData(cache, npc, held = []) {
   const models = (await Promise.all(npc.models.map((id) => cache.model(id)))).filter(Boolean);
   if (!models.length) return null;
-  const merged = mergeModels(models);
-  npc.recolorToFind.forEach((color, i) => recolor(merged, color, npc.recolorToReplace[i]));
+  const items = [];
+  for (const item of held) {
+    for (const id of [item.maleModel0, item.maleModel1, item.maleModel2]) {
+      const model = id >= 0 ? await cache.model(id) : null;
+      if (model) items.push({ model: item.maleOffset ? { ...model, vertexY: model.vertexY.map((y) => y + item.maleOffset) } : model, item });
+    }
+  }
+  const merged = mergeModels([...models, ...items.map(({ model }) => model)]);
+  // The NPC's recolours apply to its own faces; each item keeps its own.
+  let faceStart = 0;
+  const recolorFaces = (count, find, replace) => {
+    const range = { colors: merged.colors.slice(faceStart, faceStart + count) };
+    find.forEach((color, i) => recolor(range, color & 0xffff, replace[i] & 0xffff));
+    merged.colors.splice(faceStart, count, ...range.colors);
+    faceStart += count;
+  };
+  recolorFaces(models.reduce((sum, model) => sum + model.faceCount, 0), npc.recolorToFind, npc.recolorToReplace);
+  for (const { model, item } of items) recolorFaces(model.faceCount, item.colorFind, item.colorReplace);
   if (npc.widthScale !== 128 || npc.heightScale !== 128) {
     merged.vertexX = merged.vertexX.map((x) => Math.trunc((x * npc.widthScale) / 128));
     merged.vertexY = merged.vertexY.map((y) => Math.trunc((y * npc.heightScale) / 128));
