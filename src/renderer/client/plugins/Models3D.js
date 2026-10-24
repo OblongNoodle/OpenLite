@@ -14,7 +14,7 @@ import { OsrsCache, OsrsPlayerModel, buildNpcData, buildPlayerData, findNpc } fr
 import { buildLoc, createLocMeshes, osrsTextureCanvas } from "./models3d/osrs/locs.js";
 import { findOsrsItem, osrsItemIcon, osrsItemModel } from "./models3d/osrs/itemIcons.js";
 import { osrsNameCandidates } from "./models3d/osrs/itemNames.js";
-import { attachClickProxies, installClickPredicate, releaseClickMeshes, uninstallClickPredicate } from "./models3d/clickProxies.js";
+import { attachBoxClickProxy, attachClickProxies, installClickPredicate, releaseClickMeshes, uninstallClickPredicate } from "./models3d/clickProxies.js";
 import { ActionState } from "@highlite/core";
 
 // OSRS objects drawn for the game's scenery, by kind, and once used up (a
@@ -56,15 +56,33 @@ const OSRS_FURNITURE_BY_MODEL = {
   "bookshelf1.obj": 380, // BOOKCASE
   "gravestone1.obj": 404, // GRAVESTONE1
   "gravestone2.obj": 405, // GRAVESTONE2
-  "haystack1.obj": 298 // HAYSTACK
+  "haystack1.obj": 298, // HAYSTACK
+  "door1.obj": 1535 // DOOR (wooden)
 };
 const OSRS_FURNITURE_BY_NAME = { Crate: 354 }; // CRATE2
+// Crops, by the game object's name (the game draws them all as one flat
+// plant model): OSRS's own, a variant picked per spot. They stand at OSRS's
+// scale, turned a quarter turn per spot, and vanish while picked clean.
+const OSRS_CROPS_BY_NAME = {
+  "Flax Plant": [14896], // FLAX
+  Wheat: [15506, 15507, 15508], // WHEAT (Lumbridge's field)
+  Potatoes: [312], // POTATO
+  Onions: [3366] // ONION
+};
+// How much wider than OSRS's some crops are drawn: the game plants wheat on
+// only about a third of a field's tiles, where OSRS plants every tile.
+const CROP_SPREAD = { Wheat: 1.5 };
+// How wide (and deep) a crop's click box is, in tiles.
+const CROP_CLICK_WIDTH = 0.8;
+// How far below the world a picked-clean crop's model (with its click area)
+// is put, as the game does with its own.
+const HIDDEN_CROP_DROP = 100;
 // Tables: the plank table for long ones, the small square one otherwise.
 const OSRS_LONG_TABLE = 601; // TABLE2
 const OSRS_SMALL_TABLE = 602; // TABLE
 // How far each OSRS model is turned from the game model it replaces (their
 // fronts differ), by the game's model file.
-const FURNITURE_FACING = { "stove1.obj": Math.PI };
+const FURNITURE_FACING = { "stove1.obj": Math.PI, "door1.obj": Math.PI / 2 };
 // How far one axis may stretch (or squeeze) past the height's scale when
 // fitting.
 const FURNITURE_MAX_STRETCH = 1.6;
@@ -73,7 +91,19 @@ function osrsFurnitureFacing(entity) {
   return FURNITURE_FACING[String(entity._appearance?._meshFileName ?? "").split("%")[0]] ?? 0;
 }
 
+// A number fixed for an object's spot, for picking variants and turns.
+function spotSeed(entity) {
+  const position = entity._currentGamePosition;
+  return Math.abs(Math.floor(position?._x ?? 0) * 7 + Math.floor(position?._z ?? 0) * 13);
+}
+
+function osrsCropObjects(entity) {
+  return OSRS_CROPS_BY_NAME[entity._def?._name ?? entity._name] ?? null;
+}
+
 function osrsFurnitureObject(entity) {
+  const crop = osrsCropObjects(entity);
+  if (crop) return crop[spotSeed(entity) % crop.length];
   const model = String(entity._appearance?._meshFileName ?? "").split("%")[0];
   if (model === "table1.obj") return Math.max(entity._width ?? 1, entity._length ?? 1) >= 1.5 ? OSRS_LONG_TABLE : OSRS_SMALL_TABLE;
   return OSRS_FURNITURE_BY_MODEL[model] ?? OSRS_FURNITURE_BY_NAME[entity._def?._name] ?? null;
@@ -415,6 +445,7 @@ var Models3D = class extends Plugin {
     this.renderGroundItems();
     this.renderScenery();
     this.renderFurniture();
+    this.updateCrops();
     // OSRS scenery and furniture are clicked by their own shapes (see
     // models3d/clickProxies.js).
     installClickPredicate(this.gameHooks.GameEngine?.Instance);
@@ -595,14 +626,14 @@ var Models3D = class extends Plugin {
 
   // A hidden prototype of an OSRS object's meshes (see models3d/osrs/locs.js);
   // each tree or rock is a clone sharing its geometry.
-  osrsLocMesh(objectId, wrapTexture = null) {
+  osrsLocMesh(objectId, wrapTexture = null, dropGroundFaces = false) {
     this.locPrototypes ??= new Map();
-    const key = `${objectId}:${wrapTexture}`;
+    const key = `${objectId}:${wrapTexture}:${dropGroundFaces}`;
     if (!this.locPrototypes.has(key)) {
       this.locPrototypes.set(key, (async () => {
         const cache = await OsrsCache.open();
         const object = (await cache.objects()).get(objectId);
-        const data = object && (await buildLoc(cache, object, { wrapTexture }));
+        const data = object && (await buildLoc(cache, object, { wrapTexture, dropGroundFaces }));
         if (!data || !this.locPrototypes) return null;
         const root = await createLocMeshes(this.ctors.Mesh, this.scene, data, this.getOsrsMaterial(), (id) => this.locTextureMaterial(id), `models3d-loc-${objectId}`);
         root.setEnabled(false);
@@ -761,7 +792,8 @@ var Models3D = class extends Plugin {
         if (objectId === null) continue;
         seen.add(entity);
         if (this.furnitureRecords.has(entity)) continue;
-        const record = { entity, meshes, mesh: null };
+        const crop = !!osrsCropObjects(entity);
+        const record = { entity, meshes, mesh: null, crop, shown: true };
         this.furnitureRecords.set(entity, record);
         // Hidden at once, so the game's model never shows while the OSRS one
         // is made (instances draw with their source mesh's visibility, so the
@@ -770,11 +802,23 @@ var Models3D = class extends Plugin {
           for (const mesh of meshes) (mesh.sourceMesh ?? mesh).visibility = visible ? 1 : 0;
         };
         setOriginalsVisible(false);
-        this.osrsLocMesh(objectId).then((prototype) => {
+        this.osrsLocMesh(objectId, null, crop).then((prototype) => {
           if (this.furnitureRecords?.get(entity) !== record) return;
-          record.mesh = prototype && this.placeFurniture(prototype, meshes, appearance, entity.EntityID ?? entity._entityId, osrsFurnitureFacing(entity));
-          if (record.mesh) attachClickProxies(this.ctors.Mesh, record.mesh, meshes);
-          else setOriginalsVisible(true);
+          const id = entity.EntityID ?? entity._entityId;
+          const spread = OSRS_WORLD_SCALE * (CROP_SPREAD[entity._def?._name ?? entity._name] ?? 1);
+          record.mesh = prototype && (crop
+            ? this.placeFurniture(prototype, meshes, appearance, id, (spotSeed(entity) % 4) * (Math.PI / 2), [spread, OSRS_WORLD_SCALE, spread])
+            : this.placeFurniture(prototype, meshes, appearance, id, osrsFurnitureFacing(entity)));
+          if (record.mesh) {
+            // Crops are clicked by a box around them: their stalks are too
+            // thin to hit when zoomed out.
+            if (crop) attachBoxClickProxy(this.ctors.Mesh, record.mesh, meshes, CROP_CLICK_WIDTH);
+            else attachClickProxies(this.ctors.Mesh, record.mesh, meshes);
+            record.shown = true;
+            if (crop) this.updateCropShown(record);
+          } else {
+            setOriginalsVisible(true);
+          }
         }).catch((error) => {
           setOriginalsVisible(true);
           this.error("Building OSRS furniture failed", error);
@@ -788,8 +832,33 @@ var Models3D = class extends Plugin {
     }
   }
 
-  // A clone of an OSRS object fitted over the original's meshes.
-  placeFurniture(prototype, meshes, appearance, id, facing = 0) {
+  // A picked-clean crop's model goes (with its click area) when the game
+  // hides its own, and comes back where the game's own reappears when it
+  // regrows.
+  updateCropShown(record) {
+    const shown = record.meshes.some((mesh) => mesh.isEnabled());
+    if (!record.mesh || shown === record.shown) return;
+    record.shown = shown;
+    record.mesh.setEnabled(shown);
+    if (!shown) {
+      record.mesh.position.y -= HIDDEN_CROP_DROP;
+      return;
+    }
+    let bottom = Infinity;
+    for (const mesh of record.meshes) {
+      mesh.computeWorldMatrix(true);
+      bottom = Math.min(bottom, mesh.getBoundingInfo().boundingBox.minimumWorld.y);
+    }
+    record.mesh.position.y = Number.isFinite(bottom) ? bottom + (record.mesh.osrsBottomOffset ?? 0) : record.mesh.position.y + HIDDEN_CROP_DROP;
+  }
+
+  updateCrops() {
+    for (const record of this.furnitureRecords?.values() ?? []) if (record.crop) this.updateCropShown(record);
+  }
+
+  // A clone of an OSRS object fitted over the original's meshes (or, with a
+  // `scale` (one number or [x, y, z]), at that scale, centred on it).
+  placeFurniture(prototype, meshes, appearance, id, facing = 0, scale = null) {
     let min = null, max = null;
     for (const mesh of meshes) {
       mesh.computeWorldMatrix(true);
@@ -813,12 +882,14 @@ var Models3D = class extends Plugin {
     // scale (chairs and crates keep their shape).
     const up = dy / Math.max(size.height, 0.01);
     const fit = (target, length) => Math.min(up * FURNITURE_MAX_STRETCH, Math.max(up / FURNITURE_MAX_STRETCH, target / Math.max(length, 0.01)));
-    mesh.scaling.set(fit(across ? dx : dz, size.width), up, fit(across ? dz : dx, size.depth));
+    if (scale) mesh.scaling.set(...(Array.isArray(scale) ? scale : [scale, scale, scale]));
+    else mesh.scaling.set(fit(across ? dx : dz, size.width), up, fit(across ? dz : dx, size.depth));
     // Centre it on the original (OSRS models are not always centred).
     mesh.position.set(0, 0, 0);
     mesh.computeWorldMatrix(true);
     const bounds = mesh.getHierarchyBoundingVectors(true);
     mesh.position.set((min.x + max.x) / 2 - (bounds.min.x + bounds.max.x) / 2, min.y - bounds.min.y, (min.z + max.z) / 2 - (bounds.min.z + bounds.max.z) / 2);
+    mesh.osrsBottomOffset = -bounds.min.y;
     return mesh;
   }
 

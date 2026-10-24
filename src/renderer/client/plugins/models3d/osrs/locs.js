@@ -112,7 +112,10 @@ export function lightness(model, ambient, contrast) {
 // lacks its models.
 //   wrapTexture: put this texture on every face, tinted by the face's own
 //     colour (OSRS's ore rocks are one plain colour; this gives them stone).
-export async function buildLoc(cache, object, { wrapTexture = null } = {}) {
+// With `dropGroundFaces`, faces lying flat on the ground are left out (some
+// ground plants, flax among them, have a coloured square at their foot that
+// OSRS doesn't show).
+export async function buildLoc(cache, object, { wrapTexture = null, dropGroundFaces = false } = {}) {
   const shape = object.types ? SHAPE_ORDER.find((s) => object.types.includes(s)) ?? object.types[0] : null;
   const ids = object.types ? object.models.filter((_, i) => object.types[i] === shape) : object.models;
   const models = (await Promise.all(ids.map((id) => cache.model(id)))).filter(Boolean);
@@ -127,6 +130,11 @@ export async function buildLoc(cache, object, { wrapTexture = null } = {}) {
   data.vertexX = data.vertexX.map((x) => Math.trunc((x * object.scaleX) / 128) + object.offsetX);
   data.vertexY = data.vertexY.map((y) => Math.trunc((y * object.scaleY) / 128) - object.offsetY);
   data.vertexZ = data.vertexZ.map((z) => Math.trunc((z * object.scaleZ) / 128) + object.offsetZ);
+  if (dropGroundFaces) {
+    data.faceA.forEach((a, f) => {
+      if ([a, data.faceB[f], data.faceC[f]].every((v) => data.vertexY[v] >= 0)) data.renderTypes[f] = 2;
+    });
+  }
   data.lightness = lightness(data, 64 + object.ambient, 768 + object.contrast);
   if (wrapTexture !== null) {
     data.tinted = true;
