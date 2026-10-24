@@ -80,23 +80,30 @@ function recipeTable() {
   return null;
 }
 
-// The item a make prompt is for: { id, name }, or null.
-function productOf(prompt) {
+// The recipe a make prompt is for, or null.
+function recipeOf(prompt) {
   const caller = prompt?._callerData;
   const recipes = recipeTable()?.get(caller?.SelectedItem?.Def?.ID, caller?.TargetItem?.Def?.ID);
-  const def = recipes?.[caller?.ItemOnItemIndex ?? 0]?.Items?.[0]?.Def;
+  return recipes?.[caller?.ItemOnItemIndex ?? 0] ?? null;
+}
+
+// The item a make prompt is for: { id, name }, or null.
+function productOf(prompt) {
+  const def = recipeOf(prompt)?.Items?.[0]?.Def;
   const name = def?.Name ?? def?._name;
   return name ? { id: def.ID ?? def._id, name: name[0].toUpperCase() + name.slice(1) } : null;
 }
 
-// How many of the result the player's inventory has the makings of: the
-// fewer of the two items being combined (the server stops early if the
-// recipe takes more than one of something).
+// How many of the result the player's inventory has the makings of: by the
+// items the recipe uses up (a knife on logs uses only the logs), or failing
+// that the fewer of the two items being combined.
 function makeableCount(prompt) {
-  const caller = prompt?._callerData;
-  const ids = [caller?.SelectedItem?.Def?.ID, caller?.TargetItem?.Def?.ID];
   const items = document.highlite?.gameHooks?.EntityManager?.Instance?.MainPlayer?.Inventory?.Items ?? [];
   const count = (id) => items.reduce((sum, item) => sum + (item?.Def?.ID === id ? item.Amount || 1 : 0), 0);
+  const usedUp = recipeOf(prompt)?.ItemsToRemove ?? [];
+  if (usedUp.length) return Math.min(...usedUp.map((item) => Math.floor(count(item.ItemID) / Math.max(1, item.Amount))));
+  const caller = prompt?._callerData;
+  const ids = [caller?.SelectedItem?.Def?.ID, caller?.TargetItem?.Def?.ID];
   if (ids.some((id) => id === undefined)) return 0;
   return ids[0] === ids[1] ? Math.floor(count(ids[0]) / 2) : Math.min(count(ids[0]), count(ids[1]));
 }
